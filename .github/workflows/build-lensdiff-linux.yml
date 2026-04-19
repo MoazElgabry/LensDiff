@@ -1,0 +1,86 @@
+name: Build LensDiff Linux
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve package version
+        id: version
+        run: |
+          version="$(grep -Eo 'set\(CUBE_DISPLAY_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+          if [ -z "${version}" ]; then
+            version="$(grep -Eo 'project\([^)]*VERSION [0-9A-Za-z.\-]+' CMakeLists.txt | sed -E 's/.*VERSION ([0-9A-Za-z.\-]+)/\1/' | head -n1)"
+          fi
+          if [ -z "${version}" ]; then
+            echo "Could not determine LensDiff version from source/CMakeLists.txt"
+            exit 1
+          fi
+          echo "package_version=${version}" >> "$GITHUB_OUTPUT"
+          echo "archive_name=LensDiff_v${version}_linux_x86_64_cuda_cpu_portable.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=LensDiff-v${version}-linux-x86_64-cuda-cpu" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure local OFX SDK is available
+        run: |
+          if [ ! -f "ofx-sdk/include/ofxImageEffect.h" ]; then
+            rm -rf ofx-sdk
+            git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git ofx-sdk
+          fi
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ gcc-10 g++-10 nvidia-cuda-toolkit
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=/usr/bin/gcc-10 \
+            -DCMAKE_CXX_COMPILER=/usr/bin/g++-10 \
+            -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-10
+
+      - name: Build
+        run: cmake --build build-linux --config Release -j
+
+      - name: Verify bundle outputs
+        run: |
+          test -f bundle/LensDiff.ofx.bundle/Contents/Linux-x86-64/LensDiff.ofx
+          test -f bundle/LensDiff.ofx.bundle/Contents/Resources/com.moazelgabry.lensdiff.png
+          if ! find build-linux \( -iname 'LensDiffCuda.cu.o' -o -iname 'LensDiffCuda.cu.obj' \) | grep -q .; then
+            echo "Plugin CUDA object was not built."
+            exit 1
+          fi
+
+      - name: Package Linux portable bundle
+        run: |
+          package_path="${GITHUB_WORKSPACE}/${{ steps.version.outputs.archive_name }}"
+          rm -f "${package_path}"
+          tar -czf "${package_path}" -C bundle LensDiff.ofx.bundle
+
+      - name: Verify packaged Linux archive
+        run: |
+          package_path="${GITHUB_WORKSPACE}/${{ steps.version.outputs.archive_name }}"
+          test -f "${package_path}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.version.outputs.artifact_name }}
+          path: ${{ github.workspace }}/${{ steps.version.outputs.archive_name }}
+          if-no-files-found: error

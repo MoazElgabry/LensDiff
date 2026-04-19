@@ -1,0 +1,140 @@
+{
+  "generator": "LensDiff synthetic source generator",
+  "linear_light": true,
+  "format": "float32 TIFF",
+  "middle_gray": 0.18,
+  "plates": [
+    {
+      "filename": "impulse_center_1024x1024.tif",
+      "description": "Single white impulse at frame center for PSF-truth and backend parity checks.",
+      "width": 1024,
+      "height": 1024,
+      "peak": 184.32000732421875,
+      "checks": [
+        "PSF truth",
+        "backend parity",
+        "preserve-mode energy"
+      ]
+    },
+    {
+      "filename": "impulse_edge_1024x1024.tif",
+      "description": "Hot corner impulses to stress ROI expansion, edge clipping, and wraparound safety.",
+      "width": 1024,
+      "height": 1024,
+      "peak": 184.32000732421875,
+      "checks": [
+        "edge handling",
+        "ROI expansion",
+        "wraparound safety"
+      ]
+    },
+    {
+      "filename": "point_grid_1024x1024.tif",
+      "description": "Sparse white point grid for PSF consistency across the frame and repeated render checks.",
+      "width": 1024,
+      "height": 1024,
+      "peak": 92.16000366210938,
+      "checks": [
+        "field consistency",
+        "backend parity",
+        "repeated renders"
+      ]
+    },
+    {
+      "filename": "exposure_bars_1024x1024.tif",
+      "description": "Vertical exposure bars from -4 to +10 stops relative to 18% gray for threshold and softness tuning.",
+      "width": 1024,
+      "height": 1024,
+      "peak": 184.32000732421875,
+      "checks": [
+        "selection threshold",
+        "softness",
+        "exposure invariance"
+      ]
+    },
+    {
+      "filename": "spectral_points_1024x1024.tif",
+      "description": "White plus RGB primary discs for source-color interaction and spectral-style evaluation.",
+      "width": 1024,
+      "height": 1024,
+      "peak": 92.16000366210938,
+      "checks": [
+        "natural mode",
+        "creative spectrum styles",
+        "chromatic luma coupling"
+      ]
+    },
+    {
+      "filename": "window_slits_1024x1024.tif",
+      "description": "Bright slit window with a hotter edge strip for directional structure and spike readability checks.",
+      "width": 1024,
+      "height": 1024,
+      "peak": 184.32000732421875,
+      "checks": [
+        "directional structure",
+        "core versus structure split",
+        "anisotropy emphasis"
+      ]
+    },
+    {
+      "filename": "odd_dim_grid_1023x577.tif",
+      "description": "Odd-dimension point grid for host geometry, tile, and parity regression checks.",
+      "width": 1023,
+      "height": 577,
+      "peak": 92.16000366210938,
+      "checks": [
+        "odd dimensions",
+        "cropped windows",
+        "backend parity"
+      ]
+    },
+    {
+      "filename": "annular_probe_1024x1024.tif",
+      "description": "Central impulse plus annular ring of alternating warm and cool practicals for obstruction readability and circular spectral separation checks.",
+      "width": 1024,
+      "height": 1024,
+      "peak": 92.16000366210938,
+      "checks": [
+        "central obstruction readability",
+        "circular symmetry",
+        "creative spectrum tuning"
+      ]
+    },
+    {
+      "filename": "spider_vane_probe_1024x1024.tif",
+      "description": "Central star probe with aligned bright arms and ring points for vane-count, rotation, and directional-spike readability tests.",
+      "width": 1024,
+      "height": 1024,
+      "peak": 184.32000732421875,
+      "checks": [
+        "spider vane stress",
+        "rotation",
+        "anisotropy emphasis"
+      ]
+    },
+    {
+      "filename": "practicals_beauty_1024x1024.tif",
+      "description": "Warm interior practical-light scene with blown window, string lights, and lamp sources for default tuning and beauty-oriented evaluation.",
+      "width": 1024,
+      "height": 1024,
+      "peak": 80.22994232177734,
+      "checks": [
+        "default look tuning",
+        "mixed practicals",
+        "shoulder behavior"
+      ]
+    },
+    {
+      "filename": "diagonal_glints_1024x1024.tif",
+      "description": "Diagonal glints and offset point accents for rotation sensitivity, directional stability, and asymmetry checks.",
+      "width": 1024,
+      "height": 1024,
+      "peak": 130.33392333984375,
+      "checks": [
+        "rotation sensitivity",
+        "directional stability",
+        "asymmetry checks"
+      ]
+    }
+  ]
+}

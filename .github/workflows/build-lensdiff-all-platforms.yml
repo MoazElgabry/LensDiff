@@ -1,0 +1,393 @@
+name: Build LensDiff All Platforms
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  detect-changes:
+    name: Detect build-relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.changes.outputs.should_build }}
+      changed_files: ${{ steps.changes.outputs.changed_files }}
+      package_version: ${{ steps.changes.outputs.package_version }}
+      published_release_exists: ${{ steps.changes.outputs.published_release_exists }}
+      skip_reason: ${{ steps.changes.outputs.skip_reason }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether LensDiff should build
+        id: changes
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${BEFORE}" ] && [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+            git fetch --no-tags --prune --depth=1 origin "${BEFORE}" || true
+          fi
+
+          if [ -z "${BEFORE}" ] || [ "${BEFORE}" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            changed_files="$(git ls-files)"
+          else
+            changed_files="$(git diff --name-only "${BEFORE}" "${AFTER}")"
+          fi
+
+          printf '%s\n' "${changed_files}" > changed_files.txt
+
+          if grep -Eq '^(source/|common/|icons/|\.github/workflows/build-lensdiff-(all-platforms|windows|macos|linux)\.yml)' changed_files.txt; then
+            should_build="true"
+          else
+            should_build="false"
+          fi
+
+          version="$(grep -Eo 'set\(CUBE_DISPLAY_VERSION "[^"]+"\)' source/CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+          if [ -z "${version}" ]; then
+            version="$(grep -Eo 'project\([^)]*VERSION [0-9A-Za-z.\-]+' source/CMakeLists.txt | sed -E 's/.*VERSION ([0-9A-Za-z.\-]+)/\1/' | head -n1)"
+          fi
+          if [ -z "${version}" ]; then
+            echo "Could not determine LensDiff version from source/CMakeLists.txt"
+            exit 1
+          fi
+
+          final_tag="v${version}"
+          published_release_exists="false"
+          skip_reason=""
+          final_release_json="$(gh api "repos/${REPO}/releases/tags/${final_tag}" 2>/dev/null || true)"
+          if [ -n "${final_release_json}" ]; then
+            final_tag_match="$(printf '%s' "${final_release_json}" | python3 -c "import json,sys; data=json.load(sys.stdin); print(str(bool(data.get('id')) and data.get('tag_name','') == sys.argv[1]).lower())" "${final_tag}")"
+            if [ "${final_tag_match}" = "true" ]; then
+              final_is_draft="$(printf '%s' "${final_release_json}" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('draft', False)).lower())")"
+              if [ "${final_is_draft}" != "true" ]; then
+                published_release_exists="true"
+                skip_reason="Published release already exists for ${final_tag}."
+              fi
+            fi
+          fi
+
+          echo "should_build=${should_build}" >> "$GITHUB_OUTPUT"
+          echo "package_version=${version}" >> "$GITHUB_OUTPUT"
+          echo "published_release_exists=${published_release_exists}" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "changed_files<<EOF"
+            cat changed_files.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Summarize decision
+        run: |
+          if [ "${{ steps.changes.outputs.published_release_exists }}" = "true" ]; then
+            {
+              echo "LensDiff build skipped cleanly."
+              echo
+              echo "${{ steps.changes.outputs.skip_reason }}"
+              echo
+              echo "No platform artifacts were built because the release would have been skipped anyway."
+            } >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.changes.outputs.should_build }}" = "true" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            {
+              echo "LensDiff build will run."
+              echo
+              echo "Package version: v${{ steps.changes.outputs.package_version }}"
+              echo
+              echo "Relevant changes were detected in:"
+              printf '%s\n' "${{ steps.changes.outputs.changed_files }}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "LensDiff build skipped cleanly."
+              echo
+              echo "No build-relevant changes were detected."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  windows:
+    needs: detect-changes
+    if: |
+      needs.detect-changes.outputs.published_release_exists != 'true' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        needs.detect-changes.outputs.should_build == 'true'
+      )
+    uses: ./.github/workflows/build-lensdiff-windows.yml
+    secrets: inherit
+
+  macos:
+    needs: detect-changes
+    if: |
+      needs.detect-changes.outputs.published_release_exists != 'true' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        needs.detect-changes.outputs.should_build == 'true'
+      )
+    uses: ./.github/workflows/build-lensdiff-macos.yml
+    secrets: inherit
+
+  linux:
+    needs: detect-changes
+    if: |
+      needs.detect-changes.outputs.published_release_exists != 'true' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        needs.detect-changes.outputs.should_build == 'true'
+      )
+    uses: ./.github/workflows/build-lensdiff-linux.yml
+    secrets: inherit
+
+  draft-release:
+    name: Create LensDiff Draft Release
+    needs:
+      - detect-changes
+      - windows
+      - macos
+      - linux
+    if: |
+      !cancelled() &&
+      needs.windows.result == 'success' &&
+      needs.macos.result == 'success' &&
+      needs.linux.result == 'success' &&
+      needs.detect-changes.outputs.published_release_exists != 'true' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        needs.detect-changes.outputs.should_build == 'true'
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Resolve package version
+        id: version
+        working-directory: source
+        run: |
+          set -euo pipefail
+
+          version="$(grep -Eo 'set\(CUBE_DISPLAY_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+          if [ -z "${version}" ]; then
+            version="$(grep -Eo 'project\([^)]*VERSION [0-9A-Za-z.\-]+' CMakeLists.txt | sed -E 's/.*VERSION ([0-9A-Za-z.\-]+)/\1/' | head -n1)"
+          fi
+          if [ -z "${version}" ]; then
+            echo "Could not determine LensDiff version from source/CMakeLists.txt"
+            exit 1
+          fi
+          echo "package_version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare draft release metadata
+        id: draft_meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          PACKAGE_VERSION: ${{ steps.version.outputs.package_version }}
+        run: |
+          set -euo pipefail
+
+          latest_json="$(gh api "repos/${REPO}/releases/latest" 2>/dev/null || true)"
+          if [ -n "${latest_json}" ]; then
+            latest_tag="$(printf '%s' "${latest_json}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('tag_name',''))")"
+            latest_name="$(printf '%s' "${latest_json}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('name',''))")"
+            printf '%s' "${latest_json}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('body',''))" > latest_release_body.txt
+          else
+            latest_tag="unreleased"
+            latest_name="LensDiff"
+            : > latest_release_body.txt
+          fi
+
+          draft_tag="lensdiff-draft-v${PACKAGE_VERSION}"
+          draft_title="LensDiff v${PACKAGE_VERSION}"
+          final_tag="v${PACKAGE_VERSION}"
+
+          existing_draft_json="$(gh api "repos/${REPO}/releases/tags/${draft_tag}" 2>/dev/null || true)"
+          final_release_json="$(gh api "repos/${REPO}/releases/tags/${final_tag}" 2>/dev/null || true)"
+
+          draft_exists="false"
+          skip_release="false"
+          legacy_published_draft_tag="false"
+          draft_tag_match="false"
+          final_tag_match="false"
+
+          if [ -n "${existing_draft_json}" ]; then
+            draft_tag_match="$(printf '%s' "${existing_draft_json}" | python3 -c "import json,sys; data=json.load(sys.stdin); print(str(bool(data.get('id')) and data.get('tag_name','') == sys.argv[1]).lower())" "${draft_tag}")"
+          fi
+
+          if [ -n "${final_release_json}" ]; then
+            final_tag_match="$(printf '%s' "${final_release_json}" | python3 -c "import json,sys; data=json.load(sys.stdin); print(str(bool(data.get('id')) and data.get('tag_name','') == sys.argv[1]).lower())" "${final_tag}")"
+          fi
+
+          if [ "${draft_tag_match}" = "true" ]; then
+            is_draft="$(printf '%s' "${existing_draft_json}" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('draft', False)).lower())")"
+            if [ "${is_draft}" = "true" ]; then
+              draft_exists="true"
+            else
+              draft_exists="true"
+              legacy_published_draft_tag="true"
+            fi
+          fi
+
+          if [ "${final_tag_match}" = "true" ]; then
+            final_is_draft="$(printf '%s' "${final_release_json}" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('draft', False)).lower())")"
+            if [ "${final_is_draft}" != "true" ]; then
+              skip_release="true"
+            fi
+          fi
+
+          {
+            echo "DRAFT_TAG=${draft_tag}"
+            echo "DRAFT_TITLE=${draft_title}"
+            echo "LATEST_TAG=${latest_tag}"
+            echo "LATEST_NAME=${latest_name}"
+            echo "FINAL_TAG=${final_tag}"
+            echo "DRAFT_EXISTS=${draft_exists}"
+            echo "SKIP_RELEASE=${skip_release}"
+            echo "LEGACY_PUBLISHED_DRAFT_TAG=${legacy_published_draft_tag}"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "draft_exists=${draft_exists}"
+            echo "skip_release=${skip_release}"
+            echo "legacy_published_draft_tag=${legacy_published_draft_tag}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build draft release notes
+        if: steps.draft_meta.outputs.skip_release != 'true'
+        env:
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+          REF_NAME: ${{ github.ref_name }}
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          PACKAGE_VERSION: ${{ steps.version.outputs.package_version }}
+        run: |
+          set -euo pipefail
+
+          short_sha="${SHA::7}"
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          source = Path("latest_release_body.txt")
+          target = Path("latest_release_body_sanitized.txt")
+
+          if not source.exists():
+              target.write_text("", encoding="utf-8")
+              raise SystemExit(0)
+
+          text = source.read_text(encoding="utf-8")
+          text = re.sub(
+              r"<!--\s*manager-highlights:start\s*-->.*?<!--\s*manager-highlights:end\s*-->",
+              "",
+              text,
+              flags=re.DOTALL | re.IGNORECASE,
+          )
+          text = re.sub(
+              r"(?im)^\s*manager-available-stable\s*:\s*true\s*$",
+              "",
+              text,
+          )
+          text = text.strip()
+          target.write_text(f"{text}\n" if text else "", encoding="utf-8")
+          PY
+          {
+            echo "Automated draft release for LensDiff."
+            echo
+            echo "- Version: ${PACKAGE_VERSION}"
+            echo "- Base release: ${LATEST_NAME} (${LATEST_TAG})"
+            echo "- Branch: ${REF_NAME}"
+            echo "- Commit: ${short_sha}"
+            echo "- Triggered by: ${ACTOR}"
+            echo "- Workflow run: ${SERVER_URL}/${REPO}/actions/runs/${{ github.run_id }}"
+            echo
+            if [ -s latest_release_body_sanitized.txt ]; then
+              echo "## Base Release Notes"
+              echo
+              cat latest_release_body_sanitized.txt
+              echo
+            fi
+            echo "## Manager Highlights"
+            echo
+            echo "Add short user-facing highlights between the markers before publishing."
+            echo
+            echo "<!-- manager-highlights:start -->"
+            echo "<!-- manager-highlights:end -->"
+            echo
+            echo "## Included Artifacts"
+            if [ -d artifacts ]; then
+              find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec basename {} \; | sed 's/^/- /' | sort
+            else
+              echo "- No downloaded artifacts were found for this run."
+            fi
+          } > draft_release_notes.md
+
+      - name: Skip draft release because version is already published
+        if: steps.draft_meta.outputs.skip_release == 'true'
+        run: |
+          {
+            echo "LensDiff draft release skipped cleanly."
+            echo
+            echo "A published release already exists for ${FINAL_TAG}."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create or update draft release
+        if: steps.draft_meta.outputs.skip_release != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t release_files < <(find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) | sort)
+          if [ "${#release_files[@]}" -eq 0 ]; then
+            echo "No packaged LensDiff artifacts were found."
+            exit 1
+          fi
+
+          if [ "${DRAFT_EXISTS}" = "true" ]; then
+            gh release edit "${DRAFT_TAG}" \
+              --title "${DRAFT_TITLE}" \
+              --notes-file draft_release_notes.md
+            gh release upload "${DRAFT_TAG}" \
+              --clobber \
+              "${release_files[@]}"
+            {
+              if [ "${LEGACY_PUBLISHED_DRAFT_TAG}" = "true" ]; then
+                echo "LensDiff legacy draft-tag release updated."
+                echo
+                echo "- Release tag: ${DRAFT_TAG}"
+                echo "- Note: this tag already existed as a published release, so the workflow reused it instead of failing."
+              else
+                echo "LensDiff draft release updated."
+                echo
+                echo "- Draft tag: ${DRAFT_TAG}"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            gh release create "${DRAFT_TAG}" \
+              --draft \
+              --title "${DRAFT_TITLE}" \
+              --notes-file draft_release_notes.md \
+              "${release_files[@]}"
+            {
+              echo "LensDiff draft release created."
+              echo
+              echo "- Draft tag: ${DRAFT_TAG}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

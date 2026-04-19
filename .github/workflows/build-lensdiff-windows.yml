@@ -1,0 +1,136 @@
+name: Build LensDiff Windows
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-windows:
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    runs-on: windows-2022
+
+    defaults:
+      run:
+        shell: powershell
+        working-directory: source
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve package version
+        id: version
+        run: |
+          $cmake = Get-Content "CMakeLists.txt" -Raw
+          if ($cmake -match 'set\(CUBE_DISPLAY_VERSION\s+"([^"]+)"\)') {
+            $version = $Matches[1]
+          } elseif ($cmake -match 'project\([^\)]*VERSION\s+([0-9A-Za-z\.\-]+)') {
+            $version = $Matches[1]
+          } else {
+            throw "Could not determine LensDiff version from source/CMakeLists.txt"
+          }
+          "package_version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "zip_name=LensDiff_v${version}_windows_x86_64_portable.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "artifact_name=LensDiff-v${version}-windows-x86_64" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Ensure local OFX SDK is available
+        run: |
+          if (!(Test-Path "ofx-sdk/include/ofxImageEffect.h")) {
+            if (Test-Path "ofx-sdk") {
+              Remove-Item "ofx-sdk" -Recurse -Force
+            }
+            git clone --depth 1 https://github.com/AcademySoftwareFoundation/openfx.git "ofx-sdk"
+          }
+
+      - name: Locate Visual Studio developer command prompt
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (!(Test-Path $vswhere)) {
+            throw "vswhere.exe was not found at $vswhere"
+          }
+          $installationPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installationPath) {
+            throw "Unable to locate a Visual Studio installation with C++ tools."
+          }
+          $vsDevCmd = Join-Path $installationPath "Common7\Tools\VsDevCmd.bat"
+          if (!(Test-Path $vsDevCmd)) {
+            throw "VsDevCmd.bat was not found at $vsDevCmd"
+          }
+          "VSDEVCMD=$vsDevCmd" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Detect preinstalled Ninja
+        id: detect_ninja
+        run: |
+          $ninja = Get-Command ninja -ErrorAction SilentlyContinue
+          if ($null -ne $ninja) {
+            "has_ninja=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            & ninja --version
+          } else {
+            "has_ninja=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Install Ninja
+        if: steps.detect_ninja.outputs.has_ninja != 'true'
+        run: choco install ninja --no-progress -y
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.30
+        with:
+          cuda: "12.9.1"
+
+      - name: Verify CUDA toolkit
+        run: |
+          nvcc --version
+          if (-not $env:CUDA_PATH) {
+            throw "CUDA_PATH was not set by the CUDA toolkit installer."
+          }
+          $hostConfig = Join-Path $env:CUDA_PATH "include\\crt\\host_config.h"
+          if (-not (Test-Path $hostConfig -PathType Leaf)) {
+            throw "CUDA toolkit install is incomplete. Missing required compiler header: $hostConfig"
+          }
+
+      - name: Configure
+        run: |
+          cmd /c "call ""$env:VSDEVCMD"" -arch=x64 -host_arch=x64 && cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release -DCUDAToolkit_ROOT=""$env:CUDA_PATH"" -DCMAKE_CUDA_COMPILER=""$env:CUDA_PATH\\bin\\nvcc.exe"" -DCMAKE_CUDA_ARCHITECTURES=""61;75;86;89"""
+
+      - name: Build
+        run: |
+          cmd /c "call ""$env:VSDEVCMD"" -arch=x64 -host_arch=x64 && cmake --build build-win --config Release"
+
+      - name: Verify bundle outputs
+        run: |
+          if (!(Test-Path "bundle/LensDiff.ofx.bundle/Contents/Win64/LensDiff.ofx")) {
+            throw "Missing Windows plugin binary"
+          }
+          if (!(Test-Path "bundle/LensDiff.ofx.bundle/Contents/Resources/com.moazelgabry.lensdiff.png")) {
+            throw "Missing Windows bundle icon resource"
+          }
+          $cudaObjects = Get-ChildItem "build-win" -Recurse -Filter "LensDiffCuda.cu.obj" -ErrorAction SilentlyContinue
+          if (-not $cudaObjects) {
+            throw "Plugin CUDA object was not built."
+          }
+
+      - name: Package Windows portable bundle
+        run: |
+          $zipName = "${{ steps.version.outputs.zip_name }}"
+          $packagePath = Join-Path $env:GITHUB_WORKSPACE $zipName
+          if (Test-Path $packagePath) { Remove-Item $packagePath -Force }
+          Compress-Archive -Path "bundle/LensDiff.ofx.bundle" -DestinationPath $packagePath -CompressionLevel Optimal
+
+      - name: Verify packaged Windows archive
+        run: |
+          $packagePath = Join-Path $env:GITHUB_WORKSPACE "${{ steps.version.outputs.zip_name }}"
+          if (!(Test-Path $packagePath)) {
+            throw "Missing packaged Windows archive at $packagePath"
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.version.outputs.artifact_name }}
+          path: ${{ github.workspace }}/${{ steps.version.outputs.zip_name }}
+          if-no-files-found: error

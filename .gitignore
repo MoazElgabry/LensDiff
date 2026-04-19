@@ -1,0 +1,14 @@
+.DS_Store
+.vs/
+.vscode/
+source/build-*/
+source/build-vs/
+source/build-linux/
+source/build-linux-debug/
+source/build-macos/
+source/build-ninja/
+source/bundle/
+source/.meson-venv/
+*.user
+*.VC.db
+*.VC.opendb

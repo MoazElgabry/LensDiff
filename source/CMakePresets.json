@@ -1,0 +1,83 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "vs2026-x64",
+      "displayName": "Visual Studio 2026 x64",
+      "generator": "Visual Studio 18 2026",
+      "binaryDir": "${sourceDir}/build-vs",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "cacheVariables": {
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/build-vs/install"
+      }
+    },
+    {
+      "name": "linux-ninja-release",
+      "displayName": "Linux Ninja Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-linux",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/build-linux/install"
+      }
+    },
+    {
+      "name": "linux-ninja-debug",
+      "displayName": "Linux Ninja Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-linux-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/build-linux-debug/install"
+      }
+    },
+    {
+      "name": "macos-ninja-release",
+      "displayName": "macOS Ninja Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-macos",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "13.0",
+        "CMAKE_OSX_ARCHITECTURES": "x86_64;arm64"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-debug",
+      "displayName": "Build Debug",
+      "configurePreset": "vs2026-x64",
+      "configuration": "Debug"
+    },
+    {
+      "name": "build-release",
+      "displayName": "Build Release",
+      "configurePreset": "vs2026-x64",
+      "configuration": "Release"
+    },
+    {
+      "name": "linux-build-release",
+      "displayName": "Linux Build Release",
+      "configurePreset": "linux-ninja-release"
+    },
+    {
+      "name": "linux-build-debug",
+      "displayName": "Linux Build Debug",
+      "configurePreset": "linux-ninja-debug"
+    },
+    {
+      "name": "macos-build-release",
+      "displayName": "macOS Build Release",
+      "configurePreset": "macos-ninja-release"
+    }
+  ]
+}

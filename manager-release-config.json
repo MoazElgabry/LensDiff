@@ -1,0 +1,55 @@
+{
+  "pluginId": "lensdiff",
+  "displayName": "LensDiff",
+  "releaseRepo": "MoazElgabry/LensDiff",
+  "minManagerVersion": "0.1.0",
+  "hostProcesses": [
+    "Resolve",
+    "DaVinci Resolve",
+    "Fusion",
+    "Fusion Studio",
+    "Nuke",
+    "NukeX",
+    "NukeStudio",
+    "Hiero"
+  ],
+  "requiredFamilies": [
+    "windows",
+    "macos",
+    "linux"
+  ],
+  "availableStableMarker": "manager-available-stable",
+  "versionPattern": "(?:^|-)v(?<version>.+)$",
+  "assetRules": [
+    {
+      "family": "windows",
+      "platform": "windows",
+      "arch": "x86_64",
+      "assetPattern": "^LensDiff_.*windows.*portable\\.zip$",
+      "packageType": "zip",
+      "bundleName": "LensDiff.ofx.bundle",
+      "bundleIdentifier": "com.moazelgabry.lensdiff",
+      "installPath": "C:\\Program Files\\Common Files\\OFX\\Plugins"
+    },
+    {
+      "family": "macos",
+      "platform": "macos",
+      "arch": "universal",
+      "assetPattern": "^LensDiff_.*macOS.*portable\\.zip$",
+      "packageType": "zip",
+      "bundleName": "LensDiff.ofx.bundle",
+      "bundleIdentifier": "com.moazelgabry.lensdiff",
+      "installPath": "/Library/OFX/Plugins"
+    },
+    {
+      "family": "linux",
+      "platform": "linux",
+      "arch": "x86_64",
+      "assetPattern": "^LensDiff_.*linux.*portable\\.(?:tar\\.gz|zip)$",
+      "packageType": "tar.gz",
+      "bundleName": "LensDiff.ofx.bundle",
+      "bundleIdentifier": "com.moazelgabry.lensdiff",
+      "installPath": "/usr/OFX/Plugins"
+    }
+  ]
+}
