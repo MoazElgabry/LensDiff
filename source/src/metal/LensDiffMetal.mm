@@ -3832,6 +3832,7 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
         return false;
     }
 
+    @autoreleasepool {
     id<MTLCommandQueue> hostQueue = (__bridge id<MTLCommandQueue>)request.metalCommandQueue;
     id<MTLBuffer> srcBuffer = (__bridge id<MTLBuffer>)request.src.data;
     id<MTLBuffer> dstBuffer = (__bridge id<MTLBuffer>)request.dst.data;
@@ -4702,6 +4703,7 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                                     .count();
     logTimingBreakdown();
     return outputOk;
+    }
 }
 
 #else

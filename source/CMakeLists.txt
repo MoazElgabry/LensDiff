@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(LensDiff VERSION 0.2.2 LANGUAGES CXX)
+project(LensDiff VERSION 0.2.3 LANGUAGES CXX)
 
 set(PLUGIN_BASENAME "LensDiff")
-set(CUBE_DISPLAY_VERSION "0.2.2")
+set(CUBE_DISPLAY_VERSION "0.2.3")
 set(PLUGIN_IDENTIFIER "com.moazelgabry.LensDiff")
 set(LOCAL_OFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk")
 set(GENERATED_ASSET_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -159,6 +159,9 @@ if(APPLE)
     "-framework AppKit"
     "-framework ApplicationServices"
     "-framework ImageIO")
+  target_compile_options(${PLUGIN_BASENAME} PRIVATE
+    $<$<COMPILE_LANGUAGE:OBJC>:-fobjc-arc>
+    $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 
   find_program(XCRUN_EXECUTABLE xcrun REQUIRED)
   set(GENERATED_METAL_SOURCE "${GENERATED_ASSET_DIR}/${PLUGIN_BASENAME}Shaders.metal")
