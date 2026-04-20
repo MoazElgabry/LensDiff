@@ -68,7 +68,8 @@ jobs:
           test -f bundle/LensDiff.ofx.bundle/Contents/Resources/com.moazelgabry.LensDiff.png
           test -f bundle/LensDiff.ofx.bundle/Contents/Resources/LensDiff.metallib
           test -f bundle/LensDiff.ofx.bundle/Contents/Info.plist
-          lipo -archs bundle/LensDiff.ofx.bundle/Contents/MacOS/LensDiff.ofx | grep -q "x86_64 arm64"
+          lipo -archs bundle/LensDiff.ofx.bundle/Contents/MacOS/LensDiff.ofx | grep -q "x86_64"
+          lipo -archs bundle/LensDiff.ofx.bundle/Contents/MacOS/LensDiff.ofx | grep -q "arm64"
           otool -l bundle/LensDiff.ofx.bundle/Contents/MacOS/LensDiff.ofx | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"
 
       - name: Package macOS portable bundle

@@ -106,7 +106,7 @@ jobs:
           if (!(Test-Path "bundle/LensDiff.ofx.bundle/Contents/Win64/LensDiff.ofx")) {
             throw "Missing Windows plugin binary"
           }
-          if (!(Test-Path "bundle/LensDiff.ofx.bundle/Contents/Resources/com.moazelgabry.lensdiff.png")) {
+          if (!(Test-Path "bundle/LensDiff.ofx.bundle/Contents/Resources/com.moazelgabry.LensDiff.png")) {
             throw "Missing Windows bundle icon resource"
           }
           $cudaObjects = Get-ChildItem "build-win" -Recurse -Filter "LensDiffCuda.cu.obj" -ErrorAction SilentlyContinue
