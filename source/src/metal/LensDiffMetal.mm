@@ -5,6 +5,8 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <dlfcn.h>
+
 #include "../core/LensDiffApertureImage.h"
 #include "../core/LensDiffCpuReference.h"
 #include "../core/LensDiffDiagnostics.h"
@@ -17,9 +19,11 @@
 #include <complex>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -28,6 +32,22 @@ using Complex = std::complex<float>;
 
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kMinimumSelectedCoreFloor = 0.2f;
+
+std::uint64_t hashKernelValues(const LensDiffKernel& kernel) {
+    const std::uint64_t offset = 1469598103934665603ull;
+    const std::uint64_t prime = 1099511628211ull;
+    std::uint64_t hash = offset;
+    for (float value : kernel.values) {
+        std::uint32_t bits = 0u;
+        static_assert(sizeof(bits) == sizeof(value), "float hash size mismatch");
+        std::memcpy(&bits, &value, sizeof(bits));
+        hash ^= static_cast<std::uint64_t>(bits);
+        hash *= prime;
+    }
+    hash ^= static_cast<std::uint64_t>(kernel.size);
+    hash *= prime;
+    return hash;
+}
 
 template <typename T>
 T clampValue(T value, T lo, T hi) {
@@ -346,6 +366,21 @@ std::string nsErrorString(NSError* error) {
     return std::string(description.UTF8String ? description.UTF8String : "unknown metal error");
 }
 
+constexpr const char* kLensDiffMetalLibraryFilename = "LensDiff.metallib";
+
+std::string lensDiffBundledMetalLibraryPath() {
+    Dl_info info {};
+    if (dladdr(reinterpret_cast<const void*>(&RunLensDiffMetal), &info) == 0 || info.dli_fname == nullptr) {
+        return {};
+    }
+    const std::filesystem::path binaryPath(info.dli_fname);
+    const std::filesystem::path resourcePath = binaryPath.parent_path().parent_path() / "Resources" / kLensDiffMetalLibraryFilename;
+    if (!std::filesystem::exists(resourcePath)) {
+        return {};
+    }
+    return resourcePath.string();
+}
+
 bool validateRowBytes(const LensDiffImageView& view) {
     const std::ptrdiff_t minRowBytes = static_cast<std::ptrdiff_t>(view.bounds.width()) * 4 * static_cast<std::ptrdiff_t>(sizeof(float));
     return view.data != nullptr &&
@@ -385,6 +420,16 @@ struct ResampleParamsGpu {
     int srcHeight = 0;
     int dstWidth = 0;
     int dstHeight = 0;
+};
+
+struct FftImageParamsGpu {
+    int width = 0;
+    int height = 0;
+    int paddedSize = 0;
+    int batchStride = 0;
+    int batchCount = 0;
+    int channelIndex = 0;
+    int kernelSize = 0;
 };
 
 struct ConvolutionParamsGpu {
@@ -466,6 +511,19 @@ struct OutputParamsGpu {
 struct ReductionParamsGpu {
     int width = 0;
     int height = 0;
+};
+
+struct ScalarReduceParamsGpu {
+    int count = 0;
+};
+
+struct DynamicScaleParamsGpu {
+    int width = 0;
+    int height = 0;
+};
+
+struct PreserveScaleParamsGpu {
+    float epsilon = 1e-6f;
 };
 
 struct KernelShapeParamsGpu {
@@ -567,6 +625,7 @@ struct PipelineBundle {
     id<MTLComputePipelineState> fftColumnsStage = nil;
     id<MTLComputePipelineState> extractShiftedIntensity = nil;
     id<MTLComputePipelineState> transposeComplex = nil;
+    id<MTLComputePipelineState> transposeComplexStack = nil;
     id<MTLComputePipelineState> bitReverseBatched = nil;
     id<MTLComputePipelineState> fftBatchedStage = nil;
     id<MTLComputePipelineState> scaleComplexBatched = nil;
@@ -580,6 +639,14 @@ struct PipelineBundle {
     id<MTLComputePipelineState> prepareFromLinear = nil;
     id<MTLComputePipelineState> convolveRgb = nil;
     id<MTLComputePipelineState> convolveScalar = nil;
+    id<MTLComputePipelineState> padPlaneToComplex = nil;
+    id<MTLComputePipelineState> padRgbChannelToComplex = nil;
+    id<MTLComputePipelineState> padRgbToComplexStack = nil;
+    id<MTLComputePipelineState> scatterKernelToComplex = nil;
+    id<MTLComputePipelineState> multiplyComplex = nil;
+    id<MTLComputePipelineState> multiplyComplexBroadcast = nil;
+    id<MTLComputePipelineState> extractRealPlane = nil;
+    id<MTLComputePipelineState> packPlanesToRgba = nil;
     id<MTLComputePipelineState> applyShoulder = nil;
     id<MTLComputePipelineState> combine = nil;
     id<MTLComputePipelineState> mapSpectral = nil;
@@ -592,6 +659,9 @@ struct PipelineBundle {
     id<MTLComputePipelineState> resampleRgba = nil;
     id<MTLComputePipelineState> resampleGray = nil;
     id<MTLComputePipelineState> reduceLuma = nil;
+    id<MTLComputePipelineState> reduceFloat = nil;
+    id<MTLComputePipelineState> computePreserveScale = nil;
+    id<MTLComputePipelineState> scaleRgbDynamic = nil;
     id<MTLComputePipelineState> resampleRawPsf = nil;
     id<MTLComputePipelineState> ringSumCount = nil;
     id<MTLComputePipelineState> expandMean = nil;
@@ -633,6 +703,16 @@ struct ResampleParamsGpu {
     int srcHeight;
     int dstWidth;
     int dstHeight;
+};
+
+struct FftImageParamsGpu {
+    int width;
+    int height;
+    int paddedSize;
+    int batchStride;
+    int batchCount;
+    int channelIndex;
+    int kernelSize;
 };
 
 struct ConvolutionParamsGpu {
@@ -714,6 +794,19 @@ struct OutputParamsGpu {
 struct ReductionParamsGpu {
     int width;
     int height;
+};
+
+struct ScalarReduceParamsGpu {
+    int count;
+};
+
+struct DynamicScaleParamsGpu {
+    int width;
+    int height;
+};
+
+struct PreserveScaleParamsGpu {
+    float epsilon;
 };
 
 struct KernelShapeParamsGpu {
@@ -1415,6 +1508,20 @@ kernel void lensDiffTransposeComplexKernel(device const float2* src [[buffer(0)]
     dst[gid.x * uint(params.size) + gid.y] = src[gid.y * uint(params.size) + gid.x];
 }
 
+kernel void lensDiffTransposeComplexStackKernel(device const float2* src [[buffer(0)]],
+                                                device float2* dst [[buffer(1)]],
+                                                constant FftImageParamsGpu& params [[buffer(2)]],
+                                                uint2 gid [[thread_position_in_grid]]) {
+    if (int(gid.x) >= params.paddedSize || int(gid.y) >= params.paddedSize * params.batchCount) {
+        return;
+    }
+    const int batchIndex = int(gid.y) / params.paddedSize;
+    const int localY = int(gid.y) - batchIndex * params.paddedSize;
+    const uint srcIndex = uint(batchIndex * params.batchStride + localY * params.paddedSize + int(gid.x));
+    const uint dstIndex = uint(batchIndex * params.batchStride + int(gid.x) * params.paddedSize + localY);
+    dst[dstIndex] = src[srcIndex];
+}
+
 kernel void lensDiffBitReverseBatchedKernel(device const float2* src [[buffer(0)]],
                                             device float2* dst [[buffer(1)]],
                                             constant BatchFftParamsGpu& params [[buffer(2)]],
@@ -1649,6 +1756,122 @@ kernel void lensDiffPrepareKernel(device const float* src [[buffer(0)]],
     driver[index] = signal * m;
 }
 
+kernel void lensDiffPadPlaneToComplexKernel(device const float* src [[buffer(0)]],
+                                            device float2* dst [[buffer(1)]],
+                                            constant FftImageParamsGpu& params [[buffer(2)]],
+                                            uint2 gid [[thread_position_in_grid]]) {
+    if (int(gid.x) >= params.paddedSize || int(gid.y) >= params.paddedSize) {
+        return;
+    }
+    const uint index = gid.y * uint(params.paddedSize) + gid.x;
+    float value = 0.0f;
+    if (int(gid.x) < params.width && int(gid.y) < params.height) {
+        value = src[gid.y * uint(params.width) + gid.x];
+    }
+    dst[index] = float2(value, 0.0f);
+}
+
+kernel void lensDiffPadRgbChannelToComplexKernel(device const float4* src [[buffer(0)]],
+                                                 device float2* dst [[buffer(1)]],
+                                                 constant FftImageParamsGpu& params [[buffer(2)]],
+                                                 uint2 gid [[thread_position_in_grid]]) {
+    if (int(gid.x) >= params.paddedSize || int(gid.y) >= params.paddedSize) {
+        return;
+    }
+    const uint index = gid.y * uint(params.paddedSize) + gid.x;
+    float value = 0.0f;
+    if (int(gid.x) < params.width && int(gid.y) < params.height) {
+        const float4 pixel = src[gid.y * uint(params.width) + gid.x];
+        switch (params.channelIndex) {
+            case 1: value = pixel.y; break;
+            case 2: value = pixel.z; break;
+            default: value = pixel.x; break;
+        }
+    }
+    dst[index] = float2(value, 0.0f);
+}
+
+kernel void lensDiffPadRgbToComplexStackKernel(device const float4* src [[buffer(0)]],
+                                               device float2* dst [[buffer(1)]],
+                                               constant FftImageParamsGpu& params [[buffer(2)]],
+                                               uint2 gid [[thread_position_in_grid]]) {
+    if (int(gid.x) >= params.paddedSize || int(gid.y) >= params.paddedSize * params.batchCount) {
+        return;
+    }
+    const int batchIndex = int(gid.y) / params.paddedSize;
+    const int localY = int(gid.y) - batchIndex * params.paddedSize;
+    const uint index = uint(batchIndex * params.batchStride + localY * params.paddedSize + int(gid.x));
+    float value = 0.0f;
+    if (int(gid.x) < params.width && localY < params.height) {
+        const float4 pixel = src[uint(localY) * uint(params.width) + gid.x];
+        switch (batchIndex) {
+            case 1: value = pixel.y; break;
+            case 2: value = pixel.z; break;
+            default: value = pixel.x; break;
+        }
+    }
+    dst[index] = float2(value, 0.0f);
+}
+
+kernel void lensDiffScatterKernelToComplexKernel(device const float* kernelValues [[buffer(0)]],
+                                                 device float2* dst [[buffer(1)]],
+                                                 constant FftImageParamsGpu& params [[buffer(2)]],
+                                                 uint2 gid [[thread_position_in_grid]]) {
+    if (int(gid.x) >= params.kernelSize || int(gid.y) >= params.kernelSize) {
+        return;
+    }
+    const int radius = params.kernelSize / 2;
+    const int dx = (int(gid.x) - radius + params.paddedSize) % params.paddedSize;
+    const int dy = (int(gid.y) - radius + params.paddedSize) % params.paddedSize;
+    dst[uint(dy) * uint(params.paddedSize) + uint(dx)] =
+        float2(kernelValues[gid.y * uint(params.kernelSize) + gid.x], 0.0f);
+}
+
+kernel void lensDiffMultiplyComplexKernel(device const float2* lhs [[buffer(0)]],
+                                          device const float2* rhs [[buffer(1)]],
+                                          device float2* dst [[buffer(2)]],
+                                          uint gid [[thread_position_in_grid]]) {
+    dst[gid] = complexMul(lhs[gid], rhs[gid]);
+}
+
+kernel void lensDiffMultiplyComplexBroadcastKernel(device const float2* lhs [[buffer(0)]],
+                                                   device const float2* rhs [[buffer(1)]],
+                                                   device float2* dst [[buffer(2)]],
+                                                   constant BatchFftParamsGpu& params [[buffer(3)]],
+                                                   uint2 gid [[thread_position_in_grid]]) {
+    if (int(gid.x) >= params.length || int(gid.y) >= params.batchCount) {
+        return;
+    }
+    const uint batchBase = gid.y * uint(params.batchStride);
+    const uint index = batchBase + gid.x;
+    dst[index] = complexMul(lhs[index], rhs[gid.x]);
+}
+
+kernel void lensDiffExtractRealPlaneKernel(device const float2* spectrum [[buffer(0)]],
+                                           device float* dst [[buffer(1)]],
+                                           constant FftImageParamsGpu& params [[buffer(2)]],
+                                           uint2 gid [[thread_position_in_grid]]) {
+    if (int(gid.x) >= params.width || int(gid.y) >= params.height) {
+        return;
+    }
+    const uint srcIndex = gid.y * uint(params.paddedSize) + gid.x;
+    const uint dstIndex = gid.y * uint(params.width) + gid.x;
+    dst[dstIndex] = max(0.0f, spectrum[srcIndex].x / max(float(params.paddedSize * params.paddedSize), 1.0f));
+}
+
+kernel void lensDiffPackPlanesToRgbaKernel(device const float* rPlane [[buffer(0)]],
+                                           device const float* gPlane [[buffer(1)]],
+                                           device const float* bPlane [[buffer(2)]],
+                                           device float4* dst [[buffer(3)]],
+                                           constant FftImageParamsGpu& params [[buffer(4)]],
+                                           uint2 gid [[thread_position_in_grid]]) {
+    if (int(gid.x) >= params.width || int(gid.y) >= params.height) {
+        return;
+    }
+    const uint index = gid.y * uint(params.width) + gid.x;
+    dst[index] = float4(max(rPlane[index], 0.0f), max(gPlane[index], 0.0f), max(bPlane[index], 0.0f), 1.0f);
+}
+
 kernel void lensDiffConvolveRgbKernel(device const float4* src [[buffer(0)]],
                                       device const float* kernelValues [[buffer(1)]],
                                       device float4* dst [[buffer(2)]],
@@ -1785,6 +2008,30 @@ kernel void lensDiffScaleRgbKernel(device float4* image [[buffer(0)]],
     image[index] = float4(image[index].xyz * params.scale, image[index].w);
 }
 
+kernel void lensDiffComputePreserveScaleKernel(device const float* inputEnergy [[buffer(0)]],
+                                               device const float* effectEnergy [[buffer(1)]],
+                                               device float* outScale [[buffer(2)]],
+                                               constant PreserveScaleParamsGpu& params [[buffer(3)]],
+                                               uint gid [[thread_position_in_grid]]) {
+    if (gid != 0u) {
+        return;
+    }
+    const float effect = effectEnergy[0];
+    const float input = inputEnergy[0];
+    outScale[0] = effect > params.epsilon ? input / effect : 1.0f;
+}
+
+kernel void lensDiffScaleRgbDynamicKernel(device float4* image [[buffer(0)]],
+                                          device const float* scale [[buffer(1)]],
+                                          constant DynamicScaleParamsGpu& params [[buffer(2)]],
+                                          uint2 gid [[thread_position_in_grid]]) {
+    if (int(gid.x) >= params.width || int(gid.y) >= params.height) {
+        return;
+    }
+    const uint index = gid.y * uint(params.width) + gid.x;
+    image[index] = float4(image[index].xyz * scale[0], image[index].w);
+}
+
 kernel void lensDiffAccumulateWeightedKernel(device const float4* src [[buffer(0)]],
                                              device float4* dst [[buffer(1)]],
                                              constant FieldBlendParamsGpu& params [[buffer(2)]],
@@ -1908,6 +2155,32 @@ kernel void lensDiffReduceLumaKernel(device const float4* src [[buffer(0)]],
     float value = 0.0f;
     if (gid < total) {
         value = safeLuma(src[gid].xyz);
+    }
+    scratch[tid] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint offset = 128u; offset > 0u; offset >>= 1u) {
+        if (tid < offset) {
+            scratch[tid] += scratch[tid + offset];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        partials[tgIndex] = scratch[0];
+    }
+}
+
+kernel void lensDiffReduceFloatKernel(device const float* src [[buffer(0)]],
+                                      device float* partials [[buffer(1)]],
+                                      constant ScalarReduceParamsGpu& params [[buffer(2)]],
+                                      uint gid [[thread_position_in_grid]],
+                                      uint tid [[thread_index_in_threadgroup]],
+                                      uint tgIndex [[threadgroup_position_in_grid]]) {
+    threadgroup float scratch[256];
+    float value = 0.0f;
+    if (int(gid) < params.count) {
+        value = src[gid];
     }
     scratch[tid] = value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2080,9 +2353,27 @@ PipelineBundle* ensurePipelines(id<MTLDevice> device, std::string* error) {
         return &gPipelines;
     }
 
+    const auto libraryLoadStart = std::chrono::steady_clock::now();
+    std::string libraryMode = "runtime-source";
     NSError* libraryError = nil;
-    NSString* source = [NSString stringWithUTF8String:kLensDiffMetalSource];
-    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&libraryError];
+    id<MTLLibrary> library = nil;
+    const std::string bundledLibraryPath = lensDiffBundledMetalLibraryPath();
+    if (!bundledLibraryPath.empty()) {
+        libraryMode = "precompiled";
+        NSString* libraryPath = [NSString stringWithUTF8String:bundledLibraryPath.c_str()];
+        library = [device newLibraryWithFile:libraryPath error:&libraryError];
+    }
+    if (library == nil) {
+        if (!bundledLibraryPath.empty()) {
+            libraryMode = "runtime-source-fallback";
+        }
+        libraryError = nil;
+        NSString* source = [NSString stringWithUTF8String:kLensDiffMetalSource];
+        library = [device newLibraryWithSource:source options:nil error:&libraryError];
+    }
+    const double libraryLoadMs =
+        std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(std::chrono::steady_clock::now() - libraryLoadStart).count();
+    LogLensDiffTimingStage("metal-library-load", libraryLoadMs, "mode=" + libraryMode);
     if (library == nil) {
         if (error) {
             *error = "failed-metal-library:" + nsErrorString(libraryError);
@@ -2102,6 +2393,7 @@ PipelineBundle* ensurePipelines(id<MTLDevice> device, std::string* error) {
     next.fftColumnsStage = makePipeline(device, library, @"lensDiffFftColumnsStageKernel", error);
     next.extractShiftedIntensity = makePipeline(device, library, @"lensDiffExtractShiftedIntensityKernel", error);
     next.transposeComplex = makePipeline(device, library, @"lensDiffTransposeComplexKernel", error);
+    next.transposeComplexStack = makePipeline(device, library, @"lensDiffTransposeComplexStackKernel", error);
     next.bitReverseBatched = makePipeline(device, library, @"lensDiffBitReverseBatchedKernel", error);
     next.fftBatchedStage = makePipeline(device, library, @"lensDiffFftBatchedStageKernel", error);
     next.scaleComplexBatched = makePipeline(device, library, @"lensDiffScaleComplexBatchedKernel", error);
@@ -2115,6 +2407,14 @@ PipelineBundle* ensurePipelines(id<MTLDevice> device, std::string* error) {
     next.prepareFromLinear = makePipeline(device, library, @"lensDiffPrepareFromLinearKernel", error);
     next.convolveRgb = makePipeline(device, library, @"lensDiffConvolveRgbKernel", error);
     next.convolveScalar = makePipeline(device, library, @"lensDiffConvolveScalarKernel", error);
+    next.padPlaneToComplex = makePipeline(device, library, @"lensDiffPadPlaneToComplexKernel", error);
+    next.padRgbChannelToComplex = makePipeline(device, library, @"lensDiffPadRgbChannelToComplexKernel", error);
+    next.padRgbToComplexStack = makePipeline(device, library, @"lensDiffPadRgbToComplexStackKernel", error);
+    next.scatterKernelToComplex = makePipeline(device, library, @"lensDiffScatterKernelToComplexKernel", error);
+    next.multiplyComplex = makePipeline(device, library, @"lensDiffMultiplyComplexKernel", error);
+    next.multiplyComplexBroadcast = makePipeline(device, library, @"lensDiffMultiplyComplexBroadcastKernel", error);
+    next.extractRealPlane = makePipeline(device, library, @"lensDiffExtractRealPlaneKernel", error);
+    next.packPlanesToRgba = makePipeline(device, library, @"lensDiffPackPlanesToRgbaKernel", error);
     next.applyShoulder = makePipeline(device, library, @"lensDiffApplyShoulderKernel", error);
     next.combine = makePipeline(device, library, @"lensDiffCombineKernel", error);
     next.mapSpectral = makePipeline(device, library, @"lensDiffMapSpectralKernel", error);
@@ -2127,6 +2427,9 @@ PipelineBundle* ensurePipelines(id<MTLDevice> device, std::string* error) {
     next.resampleRgba = makePipeline(device, library, @"lensDiffResampleRgbaKernel", error);
     next.resampleGray = makePipeline(device, library, @"lensDiffResampleGrayKernel", error);
     next.reduceLuma = makePipeline(device, library, @"lensDiffReduceLumaKernel", error);
+    next.reduceFloat = makePipeline(device, library, @"lensDiffReduceFloatKernel", error);
+    next.computePreserveScale = makePipeline(device, library, @"lensDiffComputePreserveScaleKernel", error);
+    next.scaleRgbDynamic = makePipeline(device, library, @"lensDiffScaleRgbDynamicKernel", error);
     next.resampleRawPsf = makePipeline(device, library, @"lensDiffResampleRawPsfKernel", error);
     next.ringSumCount = makePipeline(device, library, @"lensDiffRingSumCountKernel", error);
     next.expandMean = makePipeline(device, library, @"lensDiffExpandMeanKernel", error);
@@ -2137,16 +2440,21 @@ PipelineBundle* ensurePipelines(id<MTLDevice> device, std::string* error) {
     if (next.buildPupil == nil || next.buildPhase == nil || next.embedComplexPupil == nil ||
         next.bitReverseRows == nil || next.fftRowsStage == nil ||
         next.bitReverseColumns == nil || next.fftColumnsStage == nil ||
-        next.extractShiftedIntensity == nil || next.transposeComplex == nil ||
+        next.extractShiftedIntensity == nil || next.transposeComplex == nil || next.transposeComplexStack == nil ||
         next.bitReverseBatched == nil || next.fftBatchedStage == nil || next.scaleComplexBatched == nil || next.copyComplexBatched == nil ||
         next.buildBluesteinChirp == nil || next.buildBluesteinInput == nil ||
         next.multiplyBluesteinSpectra == nil || next.extractBluesteinOutput == nil ||
         next.decodeSource == nil || next.prepare == nil || next.prepareFromLinear == nil ||
-        next.convolveRgb == nil || next.convolveScalar == nil || next.applyShoulder == nil ||
+        next.convolveRgb == nil || next.convolveScalar == nil ||
+        next.padPlaneToComplex == nil || next.padRgbChannelToComplex == nil || next.padRgbToComplexStack == nil ||
+        next.scatterKernelToComplex == nil || next.multiplyComplex == nil || next.multiplyComplexBroadcast == nil ||
+        next.extractRealPlane == nil || next.packPlanesToRgba == nil ||
+        next.applyShoulder == nil ||
         next.combine == nil || next.mapSpectral == nil || next.composite == nil || next.scaleRgb == nil ||
         next.accumulateWeighted == nil || next.creativeFringe == nil ||
         next.packGray == nil || next.packRgb == nil || next.resampleRgba == nil || next.resampleGray == nil ||
-        next.reduceLuma == nil || next.resampleRawPsf == nil ||
+        next.reduceLuma == nil || next.reduceFloat == nil || next.computePreserveScale == nil ||
+        next.scaleRgbDynamic == nil || next.resampleRawPsf == nil ||
         next.ringSumCount == nil || next.expandMean == nil || next.reshapeKernel == nil ||
         next.positiveResidual == nil || next.ringEnergyPeak == nil || next.cropKernel == nil) {
         return nullptr;
@@ -2215,15 +2523,6 @@ bool commitAndWait(id<MTLCommandBuffer> commandBuffer, std::string* error) {
         return false;
     }
     return true;
-}
-
-float sumReductionPartials(id<MTLBuffer> buffer, NSUInteger count) {
-    const float* values = static_cast<const float*>(buffer.contents);
-    float sum = 0.0f;
-    for (NSUInteger i = 0; i < count; ++i) {
-        sum += values[i];
-    }
-    return sum;
 }
 
 bool normalizeScalarBuffer(id<MTLDevice> device,
@@ -2503,6 +2802,456 @@ bool encodeBluestein2dFft(id<MTLComputeCommandEncoder> encoder,
     [encoder setBuffer:bluesteinParamsBuffer offset:0 atIndex:2];
     dispatch2d(encoder, pipelines->extractBluesteinOutput, size, size);
     return encodeTransposeComplex(encoder, pipelines, bluesteinOutput, srcSpectrum, size, error);
+}
+
+bool encodeSquareForwardFft(id<MTLComputeCommandEncoder> encoder,
+                            PipelineBundle* pipelines,
+                            id<MTLBuffer> spectrum,
+                            id<MTLBuffer> scratch,
+                            id<MTLBuffer> transpose,
+                            int size,
+                            std::string* error) {
+    if (encoder == nil || pipelines == nullptr || spectrum == nil || scratch == nil || transpose == nil || size <= 0 || !isPowerOfTwo(size)) {
+        if (error) *error = "metal-invalid-square-forward-fft";
+        return false;
+    }
+    return encodeBatchedForwardFft(encoder, pipelines, spectrum, scratch, size, size, error) &&
+           encodeTransposeComplex(encoder, pipelines, spectrum, transpose, size, error) &&
+           encodeBatchedForwardFft(encoder, pipelines, transpose, scratch, size, size, error) &&
+           encodeTransposeComplex(encoder, pipelines, transpose, spectrum, size, error);
+}
+
+bool encodeSquareInverseFft(id<MTLComputeCommandEncoder> encoder,
+                            PipelineBundle* pipelines,
+                            id<MTLBuffer> spectrum,
+                            id<MTLBuffer> scratch,
+                            id<MTLBuffer> transpose,
+                            int size,
+                            std::string* error) {
+    if (encoder == nil || pipelines == nullptr || spectrum == nil || scratch == nil || transpose == nil || size <= 0 || !isPowerOfTwo(size)) {
+        if (error) *error = "metal-invalid-square-inverse-fft";
+        return false;
+    }
+    return encodeBatchedInverseFft(encoder, pipelines, spectrum, scratch, size, size, error) &&
+           encodeTransposeComplex(encoder, pipelines, spectrum, transpose, size, error) &&
+           encodeBatchedInverseFft(encoder, pipelines, transpose, scratch, size, size, error) &&
+           encodeTransposeComplex(encoder, pipelines, transpose, spectrum, size, error);
+}
+
+bool encodeTransposeComplexStack(id<MTLComputeCommandEncoder> encoder,
+                                 PipelineBundle* pipelines,
+                                 id<MTLBuffer> src,
+                                 id<MTLBuffer> dst,
+                                 int size,
+                                 int imageCount,
+                                 std::string* error) {
+    if (encoder == nil || pipelines == nullptr || src == nil || dst == nil || size <= 0 || imageCount <= 0) {
+        if (error) *error = "metal-invalid-complex-transpose-stack";
+        return false;
+    }
+    const FftImageParamsGpu params {size, size, size, size * size, imageCount, 0, 0};
+    id<MTLBuffer> paramsBuffer = makeParamBuffer(pipelines->device, params, error);
+    if (paramsBuffer == nil) {
+        return false;
+    }
+    [encoder setBuffer:src offset:0 atIndex:0];
+    [encoder setBuffer:dst offset:0 atIndex:1];
+    [encoder setBuffer:paramsBuffer offset:0 atIndex:2];
+    dispatch2d(encoder, pipelines->transposeComplexStack, size, size * imageCount);
+    return true;
+}
+
+bool encodeSquareForwardFftStack(id<MTLComputeCommandEncoder> encoder,
+                                 PipelineBundle* pipelines,
+                                 id<MTLBuffer> spectrum,
+                                 id<MTLBuffer> scratch,
+                                 id<MTLBuffer> transpose,
+                                 int size,
+                                 int imageCount,
+                                 std::string* error) {
+    if (encoder == nil || pipelines == nullptr || spectrum == nil || scratch == nil || transpose == nil ||
+        size <= 0 || imageCount <= 0 || !isPowerOfTwo(size)) {
+        if (error) *error = "metal-invalid-square-forward-fft-stack";
+        return false;
+    }
+    const int batchCount = size * imageCount;
+    return encodeBatchedForwardFft(encoder, pipelines, spectrum, scratch, size, batchCount, error) &&
+           encodeTransposeComplexStack(encoder, pipelines, spectrum, transpose, size, imageCount, error) &&
+           encodeBatchedForwardFft(encoder, pipelines, transpose, scratch, size, batchCount, error) &&
+           encodeTransposeComplexStack(encoder, pipelines, transpose, spectrum, size, imageCount, error);
+}
+
+bool encodeSquareInverseFftStack(id<MTLComputeCommandEncoder> encoder,
+                                 PipelineBundle* pipelines,
+                                 id<MTLBuffer> spectrum,
+                                 id<MTLBuffer> scratch,
+                                 id<MTLBuffer> transpose,
+                                 int size,
+                                 int imageCount,
+                                 std::string* error) {
+    if (encoder == nil || pipelines == nullptr || spectrum == nil || scratch == nil || transpose == nil ||
+        size <= 0 || imageCount <= 0 || !isPowerOfTwo(size)) {
+        if (error) *error = "metal-invalid-square-inverse-fft-stack";
+        return false;
+    }
+    const int batchCount = size * imageCount;
+    return encodeBatchedInverseFft(encoder, pipelines, spectrum, scratch, size, batchCount, error) &&
+           encodeTransposeComplexStack(encoder, pipelines, spectrum, transpose, size, imageCount, error) &&
+           encodeBatchedInverseFft(encoder, pipelines, transpose, scratch, size, batchCount, error) &&
+           encodeTransposeComplexStack(encoder, pipelines, transpose, spectrum, size, imageCount, error);
+}
+
+bool packPlanesToRgbaMetal(id<MTLDevice> device,
+                           id<MTLCommandQueue> queue,
+                           PipelineBundle* pipelines,
+                           id<MTLBuffer> rPlane,
+                           id<MTLBuffer> gPlane,
+                           id<MTLBuffer> bPlane,
+                           int width,
+                           int height,
+                           id<MTLBuffer>* outImage,
+                           std::string* error);
+
+bool makeScalarSpectrumMetal(id<MTLDevice> device,
+                             id<MTLCommandQueue> queue,
+                             PipelineBundle* pipelines,
+                             id<MTLBuffer> srcPlane,
+                             int width,
+                             int height,
+                             int paddedSize,
+                             id<MTLBuffer>* outSpectrum,
+                             std::string* error) {
+    const NSUInteger paddedCount = static_cast<NSUInteger>(paddedSize) * static_cast<NSUInteger>(paddedSize);
+    id<MTLBuffer> spectrum = makeSharedBuffer(device, paddedCount * sizeof(float) * 2u, error);
+    id<MTLBuffer> scratch = makeSharedBuffer(device, paddedCount * sizeof(float) * 2u, error);
+    id<MTLBuffer> transpose = makeSharedBuffer(device, paddedCount * sizeof(float) * 2u, error);
+    const FftImageParamsGpu params {width, height, paddedSize, paddedSize * paddedSize, 1, 0, 0};
+    id<MTLBuffer> paramsBuffer = makeParamBuffer(device, params, error);
+    if (spectrum == nil || scratch == nil || transpose == nil || paramsBuffer == nil) {
+        return false;
+    }
+
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    [encoder setBuffer:srcPlane offset:0 atIndex:0];
+    [encoder setBuffer:spectrum offset:0 atIndex:1];
+    [encoder setBuffer:paramsBuffer offset:0 atIndex:2];
+    dispatch2d(encoder, pipelines->padPlaneToComplex, paddedSize, paddedSize);
+    const bool ok = encodeSquareForwardFft(encoder, pipelines, spectrum, scratch, transpose, paddedSize, error);
+    [encoder endEncoding];
+    if (!ok || !commitAndWait(commandBuffer, error)) {
+        return false;
+    }
+    *outSpectrum = spectrum;
+    return true;
+}
+
+bool makeRgbChannelSpectrumMetal(id<MTLDevice> device,
+                                 id<MTLCommandQueue> queue,
+                                 PipelineBundle* pipelines,
+                                 id<MTLBuffer> srcImage,
+                                 int channelIndex,
+                                 int width,
+                                 int height,
+                                 int paddedSize,
+                                 id<MTLBuffer>* outSpectrum,
+                                 std::string* error) {
+    const NSUInteger paddedCount = static_cast<NSUInteger>(paddedSize) * static_cast<NSUInteger>(paddedSize);
+    id<MTLBuffer> spectrum = makeSharedBuffer(device, paddedCount * sizeof(float) * 2u, error);
+    id<MTLBuffer> scratch = makeSharedBuffer(device, paddedCount * sizeof(float) * 2u, error);
+    id<MTLBuffer> transpose = makeSharedBuffer(device, paddedCount * sizeof(float) * 2u, error);
+    const FftImageParamsGpu params {width, height, paddedSize, paddedSize * paddedSize, 1, channelIndex, 0};
+    id<MTLBuffer> paramsBuffer = makeParamBuffer(device, params, error);
+    if (spectrum == nil || scratch == nil || transpose == nil || paramsBuffer == nil) {
+        return false;
+    }
+
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    [encoder setBuffer:srcImage offset:0 atIndex:0];
+    [encoder setBuffer:spectrum offset:0 atIndex:1];
+    [encoder setBuffer:paramsBuffer offset:0 atIndex:2];
+    dispatch2d(encoder, pipelines->padRgbChannelToComplex, paddedSize, paddedSize);
+    const bool ok = encodeSquareForwardFft(encoder, pipelines, spectrum, scratch, transpose, paddedSize, error);
+    [encoder endEncoding];
+    if (!ok || !commitAndWait(commandBuffer, error)) {
+        return false;
+    }
+    *outSpectrum = spectrum;
+    return true;
+}
+
+bool makeRgbSpectraStackMetal(id<MTLDevice> device,
+                              id<MTLCommandQueue> queue,
+                              PipelineBundle* pipelines,
+                              id<MTLBuffer> srcImage,
+                              int width,
+                              int height,
+                              int paddedSize,
+                              id<MTLBuffer>* outSpectrum,
+                              std::string* error) {
+    const NSUInteger paddedCount = static_cast<NSUInteger>(paddedSize) * static_cast<NSUInteger>(paddedSize);
+    const NSUInteger stackBytes = paddedCount * 3u * sizeof(float) * 2u;
+    id<MTLBuffer> spectrum = makeSharedBuffer(device, stackBytes, error);
+    id<MTLBuffer> scratch = makeSharedBuffer(device, stackBytes, error);
+    id<MTLBuffer> transpose = makeSharedBuffer(device, stackBytes, error);
+    const FftImageParamsGpu params {width, height, paddedSize, paddedSize * paddedSize, 3, 0, 0};
+    id<MTLBuffer> paramsBuffer = makeParamBuffer(device, params, error);
+    if (spectrum == nil || scratch == nil || transpose == nil || paramsBuffer == nil) {
+        return false;
+    }
+
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    [encoder setBuffer:srcImage offset:0 atIndex:0];
+    [encoder setBuffer:spectrum offset:0 atIndex:1];
+    [encoder setBuffer:paramsBuffer offset:0 atIndex:2];
+    dispatch2d(encoder, pipelines->padRgbToComplexStack, paddedSize, paddedSize * 3);
+    const bool ok = encodeSquareForwardFftStack(encoder, pipelines, spectrum, scratch, transpose, paddedSize, 3, error);
+    [encoder endEncoding];
+    if (!ok || !commitAndWait(commandBuffer, error)) {
+        return false;
+    }
+    *outSpectrum = spectrum;
+    return true;
+}
+
+bool makeKernelSpectrumMetal(id<MTLDevice> device,
+                             id<MTLCommandQueue> queue,
+                             PipelineBundle* pipelines,
+                             const LensDiffKernel& kernel,
+                             int paddedSize,
+                             id<MTLBuffer>* outSpectrum,
+                             std::string* error) {
+    const NSUInteger paddedCount = static_cast<NSUInteger>(paddedSize) * static_cast<NSUInteger>(paddedSize);
+    id<MTLBuffer> kernelValues = makeSharedBufferWithBytes(device,
+                                                           kernel.values.data(),
+                                                           kernel.values.size() * sizeof(float),
+                                                           error);
+    id<MTLBuffer> spectrum = makeSharedBuffer(device, paddedCount * sizeof(float) * 2u, error);
+    id<MTLBuffer> scratch = makeSharedBuffer(device, paddedCount * sizeof(float) * 2u, error);
+    id<MTLBuffer> transpose = makeSharedBuffer(device, paddedCount * sizeof(float) * 2u, error);
+    const FftImageParamsGpu params {0, 0, paddedSize, paddedSize * paddedSize, 1, 0, kernel.size};
+    id<MTLBuffer> paramsBuffer = makeParamBuffer(device, params, error);
+    if (kernelValues == nil || spectrum == nil || scratch == nil || transpose == nil || paramsBuffer == nil) {
+        return false;
+    }
+    std::memset(spectrum.contents, 0, paddedCount * sizeof(float) * 2u);
+
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    [encoder setBuffer:kernelValues offset:0 atIndex:0];
+    [encoder setBuffer:spectrum offset:0 atIndex:1];
+    [encoder setBuffer:paramsBuffer offset:0 atIndex:2];
+    dispatch2d(encoder, pipelines->scatterKernelToComplex, kernel.size, kernel.size);
+    const bool ok = encodeSquareForwardFft(encoder, pipelines, spectrum, scratch, transpose, paddedSize, error);
+    [encoder endEncoding];
+    if (!ok || !commitAndWait(commandBuffer, error)) {
+        return false;
+    }
+    *outSpectrum = spectrum;
+    return true;
+}
+
+bool convolveSpectrumToPlaneMetal(id<MTLDevice> device,
+                                  id<MTLCommandQueue> queue,
+                                  PipelineBundle* pipelines,
+                                  id<MTLBuffer> imageSpectrum,
+                                  id<MTLBuffer> kernelSpectrum,
+                                  int width,
+                                  int height,
+                                  int paddedSize,
+                                  id<MTLBuffer>* outPlane,
+                                  std::string* error) {
+    const NSUInteger paddedCount = static_cast<NSUInteger>(paddedSize) * static_cast<NSUInteger>(paddedSize);
+    const NSUInteger planeCount = static_cast<NSUInteger>(width) * static_cast<NSUInteger>(height);
+    id<MTLBuffer> tempSpectrum = makeSharedBuffer(device, paddedCount * sizeof(float) * 2u, error);
+    id<MTLBuffer> scratch = makeSharedBuffer(device, paddedCount * sizeof(float) * 2u, error);
+    id<MTLBuffer> transpose = makeSharedBuffer(device, paddedCount * sizeof(float) * 2u, error);
+    id<MTLBuffer> plane = makeSharedBuffer(device, planeCount * sizeof(float), error);
+    const FftImageParamsGpu params {width, height, paddedSize, paddedSize * paddedSize, 1, 0, 0};
+    id<MTLBuffer> paramsBuffer = makeParamBuffer(device, params, error);
+    if (tempSpectrum == nil || scratch == nil || transpose == nil || plane == nil || paramsBuffer == nil) {
+        return false;
+    }
+
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    [encoder setBuffer:imageSpectrum offset:0 atIndex:0];
+    [encoder setBuffer:kernelSpectrum offset:0 atIndex:1];
+    [encoder setBuffer:tempSpectrum offset:0 atIndex:2];
+    dispatch1d256(encoder, pipelines->multiplyComplex, paddedCount);
+    const bool ok = encodeSquareInverseFft(encoder, pipelines, tempSpectrum, scratch, transpose, paddedSize, error);
+    [encoder setBuffer:tempSpectrum offset:0 atIndex:0];
+    [encoder setBuffer:plane offset:0 atIndex:1];
+    [encoder setBuffer:paramsBuffer offset:0 atIndex:2];
+    dispatch2d(encoder, pipelines->extractRealPlane, width, height);
+    [encoder endEncoding];
+    if (!ok || !commitAndWait(commandBuffer, error)) {
+        return false;
+    }
+    *outPlane = plane;
+    return true;
+}
+
+bool convolveRgbSpectrumStackToImageMetal(id<MTLDevice> device,
+                                          id<MTLCommandQueue> queue,
+                                          PipelineBundle* pipelines,
+                                          id<MTLBuffer> imageSpectrumStack,
+                                          id<MTLBuffer> kernelSpectrum,
+                                          int width,
+                                          int height,
+                                          int paddedSize,
+                                          id<MTLBuffer>* outImage,
+                                          std::string* error) {
+    const NSUInteger paddedCount = static_cast<NSUInteger>(paddedSize) * static_cast<NSUInteger>(paddedSize);
+    const NSUInteger stackBytes = paddedCount * 3u * sizeof(float) * 2u;
+    const NSUInteger planeCount = static_cast<NSUInteger>(width) * static_cast<NSUInteger>(height);
+    id<MTLBuffer> tempSpectrum = makeSharedBuffer(device, stackBytes, error);
+    id<MTLBuffer> scratch = makeSharedBuffer(device, stackBytes, error);
+    id<MTLBuffer> transpose = makeSharedBuffer(device, stackBytes, error);
+    id<MTLBuffer> rPlane = makeSharedBuffer(device, planeCount * sizeof(float), error);
+    id<MTLBuffer> gPlane = makeSharedBuffer(device, planeCount * sizeof(float), error);
+    id<MTLBuffer> bPlane = makeSharedBuffer(device, planeCount * sizeof(float), error);
+    const BatchFftParamsGpu batchParams {static_cast<int>(paddedCount), 0, static_cast<int>(paddedCount), 3};
+    id<MTLBuffer> batchParamsBuffer = makeParamBuffer(device, batchParams, error);
+    const FftImageParamsGpu planeParams {width, height, paddedSize, paddedSize * paddedSize, 3, 0, 0};
+    id<MTLBuffer> planeParamsBuffer = makeParamBuffer(device, planeParams, error);
+    if (tempSpectrum == nil || scratch == nil || transpose == nil ||
+        rPlane == nil || gPlane == nil || bPlane == nil ||
+        batchParamsBuffer == nil || planeParamsBuffer == nil) {
+        return false;
+    }
+
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    [encoder setBuffer:imageSpectrumStack offset:0 atIndex:0];
+    [encoder setBuffer:kernelSpectrum offset:0 atIndex:1];
+    [encoder setBuffer:tempSpectrum offset:0 atIndex:2];
+    [encoder setBuffer:batchParamsBuffer offset:0 atIndex:3];
+    dispatch2d(encoder, pipelines->multiplyComplexBroadcast, static_cast<int>(paddedCount), 3);
+    const bool ok = encodeSquareInverseFftStack(encoder, pipelines, tempSpectrum, scratch, transpose, paddedSize, 3, error);
+    [encoder setBuffer:tempSpectrum offset:0 atIndex:0];
+    [encoder setBuffer:rPlane offset:0 atIndex:1];
+    [encoder setBuffer:planeParamsBuffer offset:0 atIndex:2];
+    dispatch2d(encoder, pipelines->extractRealPlane, width, height);
+    [encoder setBuffer:tempSpectrum offset:static_cast<NSUInteger>(paddedCount * sizeof(float) * 2u) atIndex:0];
+    [encoder setBuffer:gPlane offset:0 atIndex:1];
+    [encoder setBuffer:planeParamsBuffer offset:0 atIndex:2];
+    dispatch2d(encoder, pipelines->extractRealPlane, width, height);
+    [encoder setBuffer:tempSpectrum offset:static_cast<NSUInteger>(paddedCount * 2u * sizeof(float) * 2u) atIndex:0];
+    [encoder setBuffer:bPlane offset:0 atIndex:1];
+    [encoder setBuffer:planeParamsBuffer offset:0 atIndex:2];
+    dispatch2d(encoder, pipelines->extractRealPlane, width, height);
+    [encoder endEncoding];
+    if (!ok || !commitAndWait(commandBuffer, error)) {
+        return false;
+    }
+    return packPlanesToRgbaMetal(device, queue, pipelines, rPlane, gPlane, bPlane, width, height, outImage, error);
+}
+
+bool convolveScalarSpectrumToPlanesStackMetal(id<MTLDevice> device,
+                                              id<MTLCommandQueue> queue,
+                                              PipelineBundle* pipelines,
+                                              id<MTLBuffer> imageSpectrum,
+                                              const std::vector<id<MTLBuffer>>& kernelSpectra,
+                                              int width,
+                                              int height,
+                                              int paddedSize,
+                                              std::array<id<MTLBuffer>, kLensDiffMaxSpectralBins>* outPlanes,
+                                              std::string* error) {
+    if (outPlanes == nullptr) {
+        return false;
+    }
+    const int activeBins = std::min<int>(static_cast<int>(kernelSpectra.size()), kLensDiffMaxSpectralBins);
+    if (activeBins <= 0) {
+        return false;
+    }
+    const NSUInteger paddedCount = static_cast<NSUInteger>(paddedSize) * static_cast<NSUInteger>(paddedSize);
+    const NSUInteger planeCount = static_cast<NSUInteger>(width) * static_cast<NSUInteger>(height);
+    const NSUInteger spectrumSliceBytes = paddedCount * sizeof(float) * 2u;
+    const NSUInteger stackBytes = spectrumSliceBytes * static_cast<NSUInteger>(activeBins);
+    id<MTLBuffer> kernelSpectrumStack = makeSharedBuffer(device, stackBytes, error);
+    id<MTLBuffer> tempSpectrum = makeSharedBuffer(device, stackBytes, error);
+    id<MTLBuffer> scratch = makeSharedBuffer(device, stackBytes, error);
+    id<MTLBuffer> transpose = makeSharedBuffer(device, stackBytes, error);
+    const BatchFftParamsGpu batchParams {static_cast<int>(paddedCount), 0, static_cast<int>(paddedCount), activeBins};
+    id<MTLBuffer> batchParamsBuffer = makeParamBuffer(device, batchParams, error);
+    const FftImageParamsGpu planeParams {width, height, paddedSize, paddedSize * paddedSize, 1, 0, 0};
+    id<MTLBuffer> planeParamsBuffer = makeParamBuffer(device, planeParams, error);
+    if (kernelSpectrumStack == nil || tempSpectrum == nil || scratch == nil || transpose == nil ||
+        batchParamsBuffer == nil || planeParamsBuffer == nil) {
+        return false;
+    }
+    for (int i = 0; i < activeBins; ++i) {
+        if (kernelSpectra[static_cast<std::size_t>(i)] == nil) {
+            return false;
+        }
+        std::memcpy(static_cast<char*>(kernelSpectrumStack.contents) + spectrumSliceBytes * static_cast<NSUInteger>(i),
+                    kernelSpectra[static_cast<std::size_t>(i)].contents,
+                    spectrumSliceBytes);
+        (*outPlanes)[static_cast<std::size_t>(i)] = makeSharedBuffer(device, planeCount * sizeof(float), error);
+        if ((*outPlanes)[static_cast<std::size_t>(i)] == nil) {
+            return false;
+        }
+    }
+
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    [encoder setBuffer:kernelSpectrumStack offset:0 atIndex:0];
+    [encoder setBuffer:imageSpectrum offset:0 atIndex:1];
+    [encoder setBuffer:tempSpectrum offset:0 atIndex:2];
+    [encoder setBuffer:batchParamsBuffer offset:0 atIndex:3];
+    dispatch2d(encoder, pipelines->multiplyComplexBroadcast, static_cast<int>(paddedCount), activeBins);
+    const bool ok = encodeSquareInverseFftStack(encoder, pipelines, tempSpectrum, scratch, transpose, paddedSize, activeBins, error);
+    for (int i = 0; i < activeBins; ++i) {
+        [encoder setBuffer:tempSpectrum offset:spectrumSliceBytes * static_cast<NSUInteger>(i) atIndex:0];
+        [encoder setBuffer:(*outPlanes)[static_cast<std::size_t>(i)] offset:0 atIndex:1];
+        [encoder setBuffer:planeParamsBuffer offset:0 atIndex:2];
+        dispatch2d(encoder, pipelines->extractRealPlane, width, height);
+    }
+    [encoder endEncoding];
+    if (!ok || !commitAndWait(commandBuffer, error)) {
+        return false;
+    }
+    for (int i = activeBins; i < kLensDiffMaxSpectralBins; ++i) {
+        (*outPlanes)[static_cast<std::size_t>(i)] = nil;
+    }
+    return true;
+}
+
+bool packPlanesToRgbaMetal(id<MTLDevice> device,
+                           id<MTLCommandQueue> queue,
+                           PipelineBundle* pipelines,
+                           id<MTLBuffer> rPlane,
+                           id<MTLBuffer> gPlane,
+                           id<MTLBuffer> bPlane,
+                           int width,
+                           int height,
+                           id<MTLBuffer>* outImage,
+                           std::string* error) {
+    const NSUInteger pixelCount = static_cast<NSUInteger>(width) * static_cast<NSUInteger>(height);
+    id<MTLBuffer> image = makeSharedBuffer(device, pixelCount * 4u * sizeof(float), error);
+    const FftImageParamsGpu params {width, height, 0, 0, 1, 0, 0};
+    id<MTLBuffer> paramsBuffer = makeParamBuffer(device, params, error);
+    if (image == nil || paramsBuffer == nil) {
+        return false;
+    }
+
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    [encoder setBuffer:rPlane offset:0 atIndex:0];
+    [encoder setBuffer:gPlane offset:0 atIndex:1];
+    [encoder setBuffer:bPlane offset:0 atIndex:2];
+    [encoder setBuffer:image offset:0 atIndex:3];
+    [encoder setBuffer:paramsBuffer offset:0 atIndex:4];
+    dispatch2d(encoder, pipelines->packPlanesToRgba, width, height);
+    [encoder endEncoding];
+    if (!commitAndWait(commandBuffer, error)) {
+        return false;
+    }
+    *outImage = image;
+    return true;
 }
 
 bool buildOpticalPrepAndRawPsfMetal(const LensDiffParams& params,
@@ -3068,7 +3817,55 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
         return false;
     }
 
-    if (!ensurePsfBankMetal(params, cache, device, queue, pipelines, error)) {
+    struct MetalRenderTimingBreakdown {
+        double psfBankMs = 0.0;
+        double sourceFftMs = 0.0;
+        double kernelFftMs = 0.0;
+        double convolutionMs = 0.0;
+        double fieldZonesMs = 0.0;
+        double compositeOutputMs = 0.0;
+        int rgbSourceCacheHits = 0;
+        int rgbSourceCacheMisses = 0;
+        int scalarSourceCacheHits = 0;
+        int scalarSourceCacheMisses = 0;
+        int kernelCacheHits = 0;
+        int kernelCacheMisses = 0;
+    } timing {};
+
+    auto timeCall = [&](double& accumulator, auto&& fn) {
+        const auto start = std::chrono::steady_clock::now();
+        auto result = fn();
+        accumulator += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+        return result;
+    };
+    auto logTimingBreakdown = [&]() {
+        if (!LensDiffTimingEnabled()) {
+            return;
+        }
+        LogLensDiffTimingStage("metal-stage-psf-bank", timing.psfBankMs);
+        LogLensDiffTimingStage(
+            "metal-stage-source-fft",
+            timing.sourceFftMs,
+            "rgbHits=" + std::to_string(timing.rgbSourceCacheHits) +
+                ",rgbMisses=" + std::to_string(timing.rgbSourceCacheMisses) +
+                ",scalarHits=" + std::to_string(timing.scalarSourceCacheHits) +
+                ",scalarMisses=" + std::to_string(timing.scalarSourceCacheMisses));
+        LogLensDiffTimingStage(
+            "metal-stage-kernel-fft",
+            timing.kernelFftMs,
+            "hits=" + std::to_string(timing.kernelCacheHits) +
+                ",misses=" + std::to_string(timing.kernelCacheMisses));
+        LogLensDiffTimingStage("metal-stage-convolution", timing.convolutionMs);
+        LogLensDiffTimingStage(
+            "metal-stage-field-zones",
+            timing.fieldZonesMs,
+            "zones=" + std::to_string(static_cast<int>(cache.fieldZones.size())));
+        LogLensDiffTimingStage("metal-stage-composite-output", timing.compositeOutputMs);
+    };
+
+    if (!timeCall(timing.psfBankMs, [&] { return ensurePsfBankMetal(params, cache, device, queue, pipelines, error); })) {
         return false;
     }
 
@@ -3112,60 +3909,98 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
         [encoder endEncoding];
         return commitAndWait(commandBuffer, error);
     };
-    auto reduceEnergy = [&](id<MTLBuffer> imageBuffer) -> float {
-        const NSUInteger groups = ceilDiv(pixelCount, static_cast<NSUInteger>(256));
-        id<MTLBuffer> partials = makeSharedBuffer(device, groups * sizeof(float), error);
-        if (partials == nil) {
-            return 0.0f;
+    auto encode2dDispatch = [&](id<MTLComputeCommandEncoder> encoder,
+                                id<MTLComputePipelineState> pipeline,
+                                NSArray<id<MTLBuffer>>* buffers,
+                                int dispatchWidth,
+                                int dispatchHeight) -> bool {
+        if (encoder == nil || pipeline == nil || buffers == nil) {
+            if (error) *error = "metal-invalid-2d-dispatch";
+            return false;
         }
+        for (NSUInteger i = 0; i < buffers.count; ++i) {
+            [encoder setBuffer:buffers[i] offset:0 atIndex:i];
+        }
+        dispatch2d(encoder, pipeline, dispatchWidth, dispatchHeight);
+        return true;
+    };
+    auto encode1dDispatch = [&](id<MTLComputeCommandEncoder> encoder,
+                                id<MTLComputePipelineState> pipeline,
+                                NSArray<id<MTLBuffer>>* buffers,
+                                NSUInteger count) -> bool {
+        if (encoder == nil || pipeline == nil || buffers == nil) {
+            if (error) *error = "metal-invalid-1d-dispatch";
+            return false;
+        }
+        for (NSUInteger i = 0; i < buffers.count; ++i) {
+            [encoder setBuffer:buffers[i] offset:0 atIndex:i];
+        }
+        dispatch1d256(encoder, pipeline, count);
+        return true;
+    };
+    auto encodeReduceEnergyToScalar = [&](id<MTLComputeCommandEncoder> encoder,
+                                          id<MTLBuffer> imageBuffer,
+                                          id<MTLBuffer>* outScalar) -> bool {
+        if (encoder == nil || imageBuffer == nil || outScalar == nullptr) {
+            if (error) *error = "metal-invalid-reduce-energy";
+            return false;
+        }
+        const NSUInteger groups = ceilDiv(pixelCount, static_cast<NSUInteger>(256));
+        id<MTLBuffer> current = makeSharedBuffer(device, groups * sizeof(float), error);
         const ReductionParamsGpu paramsGpu {width, height};
         id<MTLBuffer> paramsBuffer = makeParamBuffer(device, paramsGpu, error);
-        if (paramsBuffer == nil) {
-            return 0.0f;
+        if (current == nil || paramsBuffer == nil) {
+            return false;
         }
-        id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
         [encoder setBuffer:imageBuffer offset:0 atIndex:0];
-        [encoder setBuffer:partials offset:0 atIndex:1];
+        [encoder setBuffer:current offset:0 atIndex:1];
         [encoder setBuffer:paramsBuffer offset:0 atIndex:2];
         dispatch1d256(encoder, pipelines->reduceLuma, pixelCount);
-        [encoder endEncoding];
-        if (!commitAndWait(commandBuffer, error)) {
-            return 0.0f;
-        }
-        return sumReductionPartials(partials, groups);
-    };
-    auto resampleRgbaBuffer = [&](id<MTLBuffer> srcImage,
-                                  int srcWidth,
-                                  int srcHeight,
-                                  int dstWidth,
-                                  int dstHeight) -> id<MTLBuffer> {
-        const NSUInteger dstPixelCount = static_cast<NSUInteger>(dstWidth) * static_cast<NSUInteger>(dstHeight);
-        id<MTLBuffer> dstImage = makeSizedBuffer(dstPixelCount * 4u * sizeof(float));
-        const ResampleParamsGpu paramsGpu {srcWidth, srcHeight, dstWidth, dstHeight};
-        id<MTLBuffer> paramsBuffer = makeParamBuffer(device, paramsGpu, error);
-        if (dstImage == nil || paramsBuffer == nil ||
-            !encode2d(pipelines->resampleRgba, @[srcImage, dstImage, paramsBuffer], dstWidth, dstHeight)) {
-            return nil;
-        }
-        return dstImage;
-    };
-    auto resampleGrayBuffer = [&](id<MTLBuffer> srcImage,
-                                  int srcWidth,
-                                  int srcHeight,
-                                  int dstWidth,
-                                  int dstHeight) -> id<MTLBuffer> {
-        const NSUInteger dstPixelCount = static_cast<NSUInteger>(dstWidth) * static_cast<NSUInteger>(dstHeight);
-        id<MTLBuffer> dstImage = makeSizedBuffer(dstPixelCount * sizeof(float));
-        const ResampleParamsGpu paramsGpu {srcWidth, srcHeight, dstWidth, dstHeight};
-        id<MTLBuffer> paramsBuffer = makeParamBuffer(device, paramsGpu, error);
-        if (dstImage == nil || paramsBuffer == nil ||
-            !encode2d(pipelines->resampleGray, @[srcImage, dstImage, paramsBuffer], dstWidth, dstHeight)) {
-            return nil;
-        }
-        return dstImage;
-    };
 
+        NSUInteger currentCount = groups;
+        while (currentCount > 1u) {
+            const NSUInteger nextCount = ceilDiv(currentCount, static_cast<NSUInteger>(256));
+            id<MTLBuffer> next = makeSharedBuffer(device, nextCount * sizeof(float), error);
+            const ScalarReduceParamsGpu scalarParams {static_cast<int>(currentCount)};
+            id<MTLBuffer> scalarParamsBuffer = makeParamBuffer(device, scalarParams, error);
+            if (next == nil || scalarParamsBuffer == nil) {
+                return false;
+            }
+            [encoder setBuffer:current offset:0 atIndex:0];
+            [encoder setBuffer:next offset:0 atIndex:1];
+            [encoder setBuffer:scalarParamsBuffer offset:0 atIndex:2];
+            dispatch1d256(encoder, pipelines->reduceFloat, currentCount);
+            current = next;
+            currentCount = nextCount;
+        }
+
+        *outScalar = current;
+        return true;
+    };
+    auto encodeResampleRgbaDispatch = [&](id<MTLComputeCommandEncoder> encoder,
+                                          id<MTLBuffer> srcImage,
+                                          id<MTLBuffer> dstImage,
+                                          int srcWidth,
+                                          int srcHeight,
+                                          int dstWidth,
+                                          int dstHeight) -> bool {
+        const ResampleParamsGpu paramsGpu {srcWidth, srcHeight, dstWidth, dstHeight};
+        id<MTLBuffer> paramsBuffer = makeParamBuffer(device, paramsGpu, error);
+        return paramsBuffer != nil &&
+               encode2dDispatch(encoder, pipelines->resampleRgba, @[srcImage, dstImage, paramsBuffer], dstWidth, dstHeight);
+    };
+    auto encodeResampleGrayDispatch = [&](id<MTLComputeCommandEncoder> encoder,
+                                          id<MTLBuffer> srcImage,
+                                          id<MTLBuffer> dstImage,
+                                          int srcWidth,
+                                          int srcHeight,
+                                          int dstWidth,
+                                          int dstHeight) -> bool {
+        const ResampleParamsGpu paramsGpu {srcWidth, srcHeight, dstWidth, dstHeight};
+        id<MTLBuffer> paramsBuffer = makeParamBuffer(device, paramsGpu, error);
+        return paramsBuffer != nil &&
+               encode2dDispatch(encoder, pipelines->resampleGray, @[srcImage, dstImage, paramsBuffer], dstWidth, dstHeight);
+    };
     const bool staticDebug = params.debugView == LensDiffDebugView::Pupil ||
                              params.debugView == LensDiffDebugView::Psf ||
                              params.debugView == LensDiffDebugView::Otf ||
@@ -3238,14 +4073,112 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
     const bool needCore = splitMode || params.debugView == LensDiffDebugView::Core;
     const bool needStructure = splitMode || params.debugView == LensDiffDebugView::Structure;
 
+    struct RgbSourceSpectraMetal {
+        int paddedSize = 0;
+        id<MTLBuffer> stack = nil;
+    };
+
+    std::unordered_map<std::string, id<MTLBuffer>> kernelSpectrumCache;
+    std::unordered_map<std::string, id<MTLBuffer>> rgbSourceSpectrumCache;
+    std::unordered_map<std::string, id<MTLBuffer>> scalarSourceSpectrumCache;
+
+    auto paddedFftSizeForKernel = [&](int kernelSize) {
+        return nextPowerOfTwo(std::max(width + kernelSize - 1, height + kernelSize - 1));
+    };
+    auto sourceSpectrumCacheKey = [&](id<MTLBuffer> source, int paddedSize) {
+        return std::to_string(reinterpret_cast<std::uintptr_t>(source)) + ":" + std::to_string(paddedSize);
+    };
+    auto kernelSpectrumCacheKey = [&](const LensDiffKernel& kernel, int paddedSize) {
+        return std::to_string(paddedSize) + ":" + std::to_string(kernel.size) + ":" + std::to_string(hashKernelValues(kernel));
+    };
+    auto getKernelSpectrum = [&](const LensDiffKernel& kernel, int paddedSize, id<MTLBuffer>* outSpectrum) -> bool {
+        if (outSpectrum == nullptr) {
+            return false;
+        }
+        const std::string key = kernelSpectrumCacheKey(kernel, paddedSize);
+        auto it = kernelSpectrumCache.find(key);
+        if (it != kernelSpectrumCache.end()) {
+            ++timing.kernelCacheHits;
+            *outSpectrum = it->second;
+            return true;
+        }
+        id<MTLBuffer> spectrum = nil;
+        ++timing.kernelCacheMisses;
+        if (!timeCall(timing.kernelFftMs, [&] {
+                return makeKernelSpectrumMetal(device, queue, pipelines, kernel, paddedSize, &spectrum, error);
+            })) {
+            return false;
+        }
+        kernelSpectrumCache.emplace(key, spectrum);
+        *outSpectrum = spectrum;
+        return true;
+    };
+    auto buildRgbSourceSpectra = [&](id<MTLBuffer> source,
+                                     int paddedSize,
+                                     RgbSourceSpectraMetal* out) -> bool {
+        if (out == nullptr) {
+            return false;
+        }
+        out->paddedSize = paddedSize;
+        const std::string key = sourceSpectrumCacheKey(source, paddedSize);
+        auto it = rgbSourceSpectrumCache.find(key);
+        if (it != rgbSourceSpectrumCache.end()) {
+            ++timing.rgbSourceCacheHits;
+            out->stack = it->second;
+            return true;
+        }
+        id<MTLBuffer> spectrum = nil;
+        ++timing.rgbSourceCacheMisses;
+        if (!timeCall(timing.sourceFftMs, [&] {
+                return makeRgbSpectraStackMetal(device, queue, pipelines, source, width, height, paddedSize, &spectrum, error);
+            })) {
+            return false;
+        }
+        rgbSourceSpectrumCache.emplace(key, spectrum);
+        out->stack = spectrum;
+        return true;
+    };
+    auto getScalarSourceSpectrum = [&](id<MTLBuffer> source,
+                                       int paddedSize,
+                                       id<MTLBuffer>* outSpectrum) -> bool {
+        if (outSpectrum == nullptr) {
+            return false;
+        }
+        const std::string key = sourceSpectrumCacheKey(source, paddedSize);
+        auto it = scalarSourceSpectrumCache.find(key);
+        if (it != scalarSourceSpectrumCache.end()) {
+            ++timing.scalarSourceCacheHits;
+            *outSpectrum = it->second;
+            return true;
+        }
+        id<MTLBuffer> spectrum = nil;
+        ++timing.scalarSourceCacheMisses;
+        if (!timeCall(timing.sourceFftMs, [&] {
+                return makeScalarSpectrumMetal(device, queue, pipelines, source, width, height, paddedSize, &spectrum, error);
+            })) {
+            return false;
+        }
+        scalarSourceSpectrumCache.emplace(key, spectrum);
+        *outSpectrum = spectrum;
+        return true;
+    };
+    auto convolveRgbSpectraToImage = [&](const RgbSourceSpectraMetal& sourceSpectra,
+                                         const LensDiffKernel& kernel,
+                                         id<MTLBuffer>* outBuffer) -> bool {
+        id<MTLBuffer> kernelSpectrum = nil;
+        if (!getKernelSpectrum(kernel, sourceSpectra.paddedSize, &kernelSpectrum) ||
+            !timeCall(timing.convolutionMs, [&] {
+                return convolveRgbSpectrumStackToImageMetal(device, queue, pipelines, sourceSpectra.stack, kernelSpectrum, width, height,
+                                                            sourceSpectra.paddedSize, outBuffer, error);
+            })) {
+            return false;
+        }
+        return true;
+    };
     auto runRgbConvolutionFromSource = [&](id<MTLBuffer> source, const LensDiffKernel& kernel, id<MTLBuffer>* outBuffer) -> bool {
-        *outBuffer = makeRgbaBuffer();
-        id<MTLBuffer> kernelBuffer = makeSharedBufferWithBytes(device, kernel.values.data(),
-                                                               kernel.values.size() * sizeof(float), error);
-        const ConvolutionParamsGpu convParams {width, height, kernel.size, kernel.size / 2};
-        id<MTLBuffer> convParamsBuffer = makeParamBuffer(device, convParams, error);
-        return *outBuffer != nil && kernelBuffer != nil && convParamsBuffer != nil &&
-               encode2d(pipelines->convolveRgb, @[source, kernelBuffer, *outBuffer, convParamsBuffer], width, height);
+        RgbSourceSpectraMetal sourceSpectra {};
+        return buildRgbSourceSpectra(source, paddedFftSizeForKernel(kernel.size), &sourceSpectra) &&
+               convolveRgbSpectraToImage(sourceSpectra, kernel, outBuffer);
     };
     auto runShoulder = [&](id<MTLBuffer> image, float shoulder) -> bool {
         if (shoulder <= 0.0f) return true;
@@ -3262,19 +4195,35 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
         std::array<id<MTLBuffer>, kLensDiffMaxSpectralBins> planes {};
         planes.fill(nil);
         const int activeBins = std::min<int>(static_cast<int>(bins.size()), kLensDiffMaxSpectralBins);
+        int maxKernelSize = 1;
         for (int i = 0; i < activeBins; ++i) {
             const LensDiffKernel* kernel = &bins[static_cast<std::size_t>(i)].full;
             if (useCore && !useStructure) kernel = &bins[static_cast<std::size_t>(i)].core;
             else if (!useCore && useStructure) kernel = &bins[static_cast<std::size_t>(i)].structure;
-            planes[static_cast<std::size_t>(i)] = makeScalarBuffer();
-            id<MTLBuffer> kernelBuffer = makeSharedBufferWithBytes(device, kernel->values.data(),
-                                                                   kernel->values.size() * sizeof(float), error);
-            const ConvolutionParamsGpu convParams {width, height, kernel->size, kernel->size / 2};
-            id<MTLBuffer> convParamsBuffer = makeParamBuffer(device, convParams, error);
-            if (planes[static_cast<std::size_t>(i)] == nil || kernelBuffer == nil || convParamsBuffer == nil ||
-                !encode2d(pipelines->convolveScalar, @[driverSource, kernelBuffer, planes[static_cast<std::size_t>(i)], convParamsBuffer], width, height)) {
+            maxKernelSize = std::max(maxKernelSize, kernel->size);
+        }
+        const int paddedSize = paddedFftSizeForKernel(maxKernelSize);
+        id<MTLBuffer> driverSpectrum = nil;
+        if (!getScalarSourceSpectrum(driverSource, paddedSize, &driverSpectrum)) {
+            return false;
+        }
+        std::vector<id<MTLBuffer>> kernelSpectra;
+        kernelSpectra.reserve(static_cast<std::size_t>(activeBins));
+        for (int i = 0; i < activeBins; ++i) {
+            const LensDiffKernel* kernel = &bins[static_cast<std::size_t>(i)].full;
+            if (useCore && !useStructure) kernel = &bins[static_cast<std::size_t>(i)].core;
+            else if (!useCore && useStructure) kernel = &bins[static_cast<std::size_t>(i)].structure;
+            id<MTLBuffer> kernelSpectrum = nil;
+            if (!getKernelSpectrum(*kernel, paddedSize, &kernelSpectrum)) {
                 return false;
             }
+            kernelSpectra.push_back(kernelSpectrum);
+        }
+        if (!timeCall(timing.convolutionMs, [&] {
+                return convolveScalarSpectrumToPlanesStackMetal(device, queue, pipelines, driverSpectrum, kernelSpectra, width, height,
+                                                                paddedSize, &planes, error);
+            })) {
+            return false;
         }
         *outBuffer = makeRgbaBuffer();
         SpectralMapParamsGpu spectralParams {};
@@ -3302,12 +4251,22 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                               id<MTLBuffer>* outCore,
                               id<MTLBuffer>* outStructure) -> bool {
         if (params.spectralMode == LensDiffSpectralMode::Mono) {
+            int monoMaxKernelSize = bins.front().full.size;
+            if (splitMode || outCore != nullptr) monoMaxKernelSize = std::max(monoMaxKernelSize, bins.front().core.size);
+            if (splitMode || outStructure != nullptr) monoMaxKernelSize = std::max(monoMaxKernelSize, bins.front().structure.size);
+            RgbSourceSpectraMetal redistributedSpectra {};
+            if (!buildRgbSourceSpectra(redistributed, paddedFftSizeForKernel(monoMaxKernelSize), &redistributedSpectra)) {
+                return false;
+            }
+            auto convolveRedistributed = [&](const LensDiffKernel& kernel, id<MTLBuffer>* outBuffer) {
+                return convolveRgbSpectraToImage(redistributedSpectra, kernel, outBuffer);
+            };
             id<MTLBuffer> localCore = nil;
             id<MTLBuffer> localStructure = nil;
             id<MTLBuffer> localFull = nil;
             if (splitMode) {
-                if ((outCore != nullptr && !runRgbConvolutionFromSource(redistributed, bins.front().core, &localCore)) ||
-                    (outStructure != nullptr && !runRgbConvolutionFromSource(redistributed, bins.front().structure, &localStructure)) ||
+                if ((outCore != nullptr && !convolveRedistributed(bins.front().core, &localCore)) ||
+                    (outStructure != nullptr && !convolveRedistributed(bins.front().structure, &localStructure)) ||
                     (outCore != nullptr && !runShoulder(localCore, static_cast<float>(params.coreShoulder))) ||
                     (outStructure != nullptr && !runShoulder(localStructure, static_cast<float>(params.structureShoulder)))) {
                     return false;
@@ -3324,12 +4283,12 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                 if (outStructure != nullptr) *outStructure = localStructure;
                 return true;
             }
-            if (!runRgbConvolutionFromSource(redistributed, bins.front().full, &localFull)) {
+            if (!convolveRedistributed(bins.front().full, &localFull)) {
                 return false;
             }
             *outEffect = localFull;
-            if (outCore != nullptr && !runRgbConvolutionFromSource(redistributed, bins.front().core, outCore)) return false;
-            if (outStructure != nullptr && !runRgbConvolutionFromSource(redistributed, bins.front().structure, outStructure)) return false;
+            if (outCore != nullptr && !convolveRedistributed(bins.front().core, outCore)) return false;
+            if (outStructure != nullptr && !convolveRedistributed(bins.front().structure, outStructure)) return false;
             return true;
         }
 
@@ -3368,12 +4327,15 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
             return false;
         }
     } else {
+        const auto fieldZonesStart = std::chrono::steady_clock::now();
         effectBuffer = makeRgbaBuffer();
         if (effectBuffer == nil || !zeroRgbaBuffer(effectBuffer) ||
             (needCore && ((coreBuffer = makeRgbaBuffer()) == nil || !zeroRgbaBuffer(coreBuffer))) ||
             (needStructure && ((structureBuffer = makeRgbaBuffer()) == nil || !zeroRgbaBuffer(structureBuffer)))) {
             return false;
         }
+        id<MTLCommandBuffer> fieldBlendCommandBuffer = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> fieldBlendEncoder = [fieldBlendCommandBuffer computeCommandEncoder];
         for (const auto& zone : cache.fieldZones) {
             id<MTLBuffer> zoneEffect = nil;
             id<MTLBuffer> zoneCore = nil;
@@ -3384,23 +4346,48 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
             const FieldBlendParamsGpu blendParams {width, height, zone.zoneX, zone.zoneY, 1.0f};
             id<MTLBuffer> blendParamsBuffer = makeParamBuffer(device, blendParams, error);
             if (blendParamsBuffer == nil ||
-                !encode2d(pipelines->accumulateWeighted, @[zoneEffect, effectBuffer, blendParamsBuffer], width, height) ||
-                (needCore && !encode2d(pipelines->accumulateWeighted, @[zoneCore, coreBuffer, blendParamsBuffer], width, height)) ||
-                (needStructure && !encode2d(pipelines->accumulateWeighted, @[zoneStructure, structureBuffer, blendParamsBuffer], width, height))) {
+                !encode2dDispatch(fieldBlendEncoder, pipelines->accumulateWeighted, @[zoneEffect, effectBuffer, blendParamsBuffer], width, height) ||
+                (needCore && !encode2dDispatch(fieldBlendEncoder, pipelines->accumulateWeighted, @[zoneCore, coreBuffer, blendParamsBuffer], width, height)) ||
+                (needStructure && !encode2dDispatch(fieldBlendEncoder, pipelines->accumulateWeighted, @[zoneStructure, structureBuffer, blendParamsBuffer], width, height))) {
                 return false;
             }
         }
+        [fieldBlendEncoder endEncoding];
+        if (!commitAndWait(fieldBlendCommandBuffer, error)) {
+            return false;
+        }
+        timing.fieldZonesMs += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                                   std::chrono::steady_clock::now() - fieldZonesStart)
+                                   .count();
     }
 
     if (params.energyMode == LensDiffEnergyMode::Preserve && effectBuffer != nil) {
-        const float inputEnergy = reduceEnergy(redistributed);
-        const float effectEnergy = reduceEnergy(effectBuffer);
-        if (effectEnergy > 1e-6f) {
-            const ScaleParamsGpu scaleParams {width, height, inputEnergy / effectEnergy};
-            id<MTLBuffer> scaleParamsBuffer = makeParamBuffer(device, scaleParams, error);
-            if (scaleParamsBuffer == nil || !encode2d(pipelines->scaleRgb, @[effectBuffer, scaleParamsBuffer], width, height)) {
-                return false;
-            }
+        id<MTLBuffer> inputEnergyBuffer = nil;
+        id<MTLBuffer> effectEnergyBuffer = nil;
+        id<MTLBuffer> preserveScaleBuffer = makeSizedBuffer(sizeof(float));
+        const PreserveScaleParamsGpu preserveScaleParams {1e-6f};
+        const DynamicScaleParamsGpu dynamicScaleParams {width, height};
+        id<MTLBuffer> preserveScaleParamsBuffer = makeParamBuffer(device, preserveScaleParams, error);
+        id<MTLBuffer> dynamicScaleParamsBuffer = makeParamBuffer(device, dynamicScaleParams, error);
+        if (preserveScaleBuffer == nil || preserveScaleParamsBuffer == nil || dynamicScaleParamsBuffer == nil) {
+            return false;
+        }
+        id<MTLCommandBuffer> preserveCommandBuffer = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> preserveEncoder = [preserveCommandBuffer computeCommandEncoder];
+        const bool ok = encodeReduceEnergyToScalar(preserveEncoder, redistributed, &inputEnergyBuffer) &&
+                        encodeReduceEnergyToScalar(preserveEncoder, effectBuffer, &effectEnergyBuffer) &&
+                        encode1dDispatch(preserveEncoder,
+                                         pipelines->computePreserveScale,
+                                         @[inputEnergyBuffer, effectEnergyBuffer, preserveScaleBuffer, preserveScaleParamsBuffer],
+                                         1) &&
+                        encode2dDispatch(preserveEncoder,
+                                         pipelines->scaleRgbDynamic,
+                                         @[effectBuffer, preserveScaleBuffer, dynamicScaleParamsBuffer],
+                                         width,
+                                         height);
+        [preserveEncoder endEncoding];
+        if (!ok || !commitAndWait(preserveCommandBuffer, error)) {
+            return false;
         }
     }
 
@@ -3459,26 +4446,49 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
 
     id<MTLBuffer> finalBuffer = nil;
     if (params.debugView == LensDiffDebugView::Final) {
+        const auto compositeStart = std::chrono::steady_clock::now();
         id<MTLBuffer> compositeRedistributed = redistributed;
         id<MTLBuffer> compositeEffect = effectBuffer;
         int compositeWidth = width;
         int compositeHeight = height;
         if (resolutionAwareActive) {
-            compositeRedistributed = resampleRgbaBuffer(redistributed, width, height, nativeWidth, nativeHeight);
-            compositeEffect = resampleRgbaBuffer(effectBuffer, width, height, nativeWidth, nativeHeight);
+            compositeRedistributed = makeNativeRgbaBuffer();
+            compositeEffect = makeNativeRgbaBuffer();
             compositeWidth = nativeWidth;
             compositeHeight = nativeHeight;
+            if (compositeRedistributed == nil || compositeEffect == nil) {
+                return false;
+            }
         }
         finalBuffer = resolutionAwareActive ? makeNativeRgbaBuffer() : makeRgbaBuffer();
         const CompositeParamsGpu compositeParams {compositeWidth, compositeHeight, effectGain, coreCompensation, maxRedistributedSubtractScale};
         id<MTLBuffer> compositeParamsBuffer = makeParamBuffer(device, compositeParams, error);
-        if (finalBuffer == nil || compositeRedistributed == nil || compositeEffect == nil || compositeParamsBuffer == nil ||
-            !encode2d(pipelines->composite,
-                      @[resolutionAwareActive ? linearSrcNative : linearSrc, compositeRedistributed, compositeEffect, finalBuffer, compositeParamsBuffer],
-                      compositeWidth,
-                      compositeHeight)) {
+        if (finalBuffer == nil || compositeRedistributed == nil || compositeEffect == nil || compositeParamsBuffer == nil) {
             return false;
         }
+        if (resolutionAwareActive) {
+            id<MTLCommandBuffer> finalCompositeCommandBuffer = [queue commandBuffer];
+            id<MTLComputeCommandEncoder> finalCompositeEncoder = [finalCompositeCommandBuffer computeCommandEncoder];
+            const bool ok = encodeResampleRgbaDispatch(finalCompositeEncoder, redistributed, compositeRedistributed, width, height, nativeWidth, nativeHeight) &&
+                            encodeResampleRgbaDispatch(finalCompositeEncoder, effectBuffer, compositeEffect, width, height, nativeWidth, nativeHeight) &&
+                            encode2dDispatch(finalCompositeEncoder,
+                                             pipelines->composite,
+                                             @[linearSrcNative, compositeRedistributed, compositeEffect, finalBuffer, compositeParamsBuffer],
+                                             compositeWidth,
+                                             compositeHeight);
+            [finalCompositeEncoder endEncoding];
+            if (!ok || !commitAndWait(finalCompositeCommandBuffer, error)) {
+                return false;
+            }
+        } else if (!encode2d(pipelines->composite,
+                             @[linearSrc, compositeRedistributed, compositeEffect, finalBuffer, compositeParamsBuffer],
+                             compositeWidth,
+                             compositeHeight)) {
+            return false;
+        }
+        timing.compositeOutputMs += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                                        std::chrono::steady_clock::now() - compositeStart)
+                                        .count();
     }
 
     const OutputParamsGpu outParams {
@@ -3494,64 +4504,153 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
         return false;
     }
 
+    const auto outputStart = std::chrono::steady_clock::now();
+    bool outputOk = false;
     switch (params.debugView) {
         case LensDiffDebugView::Selection:
-            return encode2d(pipelines->packGray,
-                            @[(resolutionAwareActive ? resampleGrayBuffer(mask, width, height, nativeWidth, nativeHeight) : mask),
-                              dstBuffer,
-                              outParamsBuffer],
-                            request.renderWindow.width(),
-                            request.renderWindow.height());
+            if (resolutionAwareActive) {
+                id<MTLBuffer> nativeMask = makeNativeScalarBuffer();
+                if (nativeMask == nil) {
+                    return false;
+                }
+                id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                const bool ok = encodeResampleGrayDispatch(encoder, mask, nativeMask, width, height, nativeWidth, nativeHeight) &&
+                                encode2dDispatch(encoder,
+                                                 pipelines->packGray,
+                                                 @[nativeMask, dstBuffer, outParamsBuffer],
+                                                 request.renderWindow.width(),
+                                                 request.renderWindow.height());
+                [encoder endEncoding];
+                outputOk = ok && commitAndWait(commandBuffer, error);
+                break;
+            }
+            outputOk = encode2d(pipelines->packGray,
+                                @[mask, dstBuffer, outParamsBuffer],
+                                request.renderWindow.width(),
+                                request.renderWindow.height());
+            break;
         case LensDiffDebugView::Core:
-            return coreBuffer != nil &&
-                   encode2d(pipelines->packRgb,
-                            @[(resolutionAwareActive ? resampleRgbaBuffer(coreBuffer, width, height, nativeWidth, nativeHeight) : coreBuffer),
-                              linearSrcNative,
-                              dstBuffer,
-                              outParamsBuffer],
-                            request.renderWindow.width(),
-                            request.renderWindow.height());
+            if (coreBuffer == nil) return false;
+            if (resolutionAwareActive) {
+                id<MTLBuffer> nativeCore = makeNativeRgbaBuffer();
+                if (nativeCore == nil) return false;
+                id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                const bool ok = encodeResampleRgbaDispatch(encoder, coreBuffer, nativeCore, width, height, nativeWidth, nativeHeight) &&
+                                encode2dDispatch(encoder,
+                                                 pipelines->packRgb,
+                                                 @[nativeCore, linearSrcNative, dstBuffer, outParamsBuffer],
+                                                 request.renderWindow.width(),
+                                                 request.renderWindow.height());
+                [encoder endEncoding];
+                outputOk = ok && commitAndWait(commandBuffer, error);
+                break;
+            }
+            outputOk = encode2d(pipelines->packRgb,
+                                @[coreBuffer, linearSrcNative, dstBuffer, outParamsBuffer],
+                                request.renderWindow.width(),
+                                request.renderWindow.height());
+            break;
         case LensDiffDebugView::Structure:
-            return structureBuffer != nil &&
-                   encode2d(pipelines->packRgb,
-                            @[(resolutionAwareActive ? resampleRgbaBuffer(structureBuffer, width, height, nativeWidth, nativeHeight) : structureBuffer),
-                              linearSrcNative,
-                              dstBuffer,
-                              outParamsBuffer],
-                            request.renderWindow.width(),
-                            request.renderWindow.height());
+            if (structureBuffer == nil) return false;
+            if (resolutionAwareActive) {
+                id<MTLBuffer> nativeStructure = makeNativeRgbaBuffer();
+                if (nativeStructure == nil) return false;
+                id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                const bool ok = encodeResampleRgbaDispatch(encoder, structureBuffer, nativeStructure, width, height, nativeWidth, nativeHeight) &&
+                                encode2dDispatch(encoder,
+                                                 pipelines->packRgb,
+                                                 @[nativeStructure, linearSrcNative, dstBuffer, outParamsBuffer],
+                                                 request.renderWindow.width(),
+                                                 request.renderWindow.height());
+                [encoder endEncoding];
+                outputOk = ok && commitAndWait(commandBuffer, error);
+                break;
+            }
+            outputOk = encode2d(pipelines->packRgb,
+                                @[structureBuffer, linearSrcNative, dstBuffer, outParamsBuffer],
+                                request.renderWindow.width(),
+                                request.renderWindow.height());
+            break;
         case LensDiffDebugView::Effect:
-            return effectBuffer != nil &&
-                   encode2d(pipelines->packRgb,
-                            @[(resolutionAwareActive ? resampleRgbaBuffer(effectBuffer, width, height, nativeWidth, nativeHeight) : effectBuffer),
-                              linearSrcNative,
-                              dstBuffer,
-                              outParamsBuffer],
-                            request.renderWindow.width(),
-                            request.renderWindow.height());
+            if (effectBuffer == nil) return false;
+            if (resolutionAwareActive) {
+                id<MTLBuffer> nativeEffect = makeNativeRgbaBuffer();
+                if (nativeEffect == nil) return false;
+                id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                const bool ok = encodeResampleRgbaDispatch(encoder, effectBuffer, nativeEffect, width, height, nativeWidth, nativeHeight) &&
+                                encode2dDispatch(encoder,
+                                                 pipelines->packRgb,
+                                                 @[nativeEffect, linearSrcNative, dstBuffer, outParamsBuffer],
+                                                 request.renderWindow.width(),
+                                                 request.renderWindow.height());
+                [encoder endEncoding];
+                outputOk = ok && commitAndWait(commandBuffer, error);
+                break;
+            }
+            outputOk = encode2d(pipelines->packRgb,
+                                @[effectBuffer, linearSrcNative, dstBuffer, outParamsBuffer],
+                                request.renderWindow.width(),
+                                request.renderWindow.height());
+            break;
         case LensDiffDebugView::Scatter:
-            return scatterPreview != nil &&
-                   encode2d(pipelines->packRgb,
-                            @[(resolutionAwareActive ? resampleRgbaBuffer(scatterPreview, width, height, nativeWidth, nativeHeight) : scatterPreview),
-                              linearSrcNative,
-                              dstBuffer,
-                              outParamsBuffer],
-                            request.renderWindow.width(),
-                            request.renderWindow.height());
+            if (scatterPreview == nil) return false;
+            if (resolutionAwareActive) {
+                id<MTLBuffer> nativeScatter = makeNativeRgbaBuffer();
+                if (nativeScatter == nil) return false;
+                id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                const bool ok = encodeResampleRgbaDispatch(encoder, scatterPreview, nativeScatter, width, height, nativeWidth, nativeHeight) &&
+                                encode2dDispatch(encoder,
+                                                 pipelines->packRgb,
+                                                 @[nativeScatter, linearSrcNative, dstBuffer, outParamsBuffer],
+                                                 request.renderWindow.width(),
+                                                 request.renderWindow.height());
+                [encoder endEncoding];
+                outputOk = ok && commitAndWait(commandBuffer, error);
+                break;
+            }
+            outputOk = encode2d(pipelines->packRgb,
+                                @[scatterPreview, linearSrcNative, dstBuffer, outParamsBuffer],
+                                request.renderWindow.width(),
+                                request.renderWindow.height());
+            break;
         case LensDiffDebugView::CreativeFringe:
-            return creativeFringePreview != nil &&
-                   encode2d(pipelines->packRgb,
-                            @[(resolutionAwareActive ? resampleRgbaBuffer(creativeFringePreview, width, height, nativeWidth, nativeHeight) : creativeFringePreview),
-                              linearSrcNative,
-                              dstBuffer,
-                              outParamsBuffer],
-                            request.renderWindow.width(),
-                            request.renderWindow.height());
+            if (creativeFringePreview == nil) return false;
+            if (resolutionAwareActive) {
+                id<MTLBuffer> nativeFringe = makeNativeRgbaBuffer();
+                if (nativeFringe == nil) return false;
+                id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                const bool ok = encodeResampleRgbaDispatch(encoder, creativeFringePreview, nativeFringe, width, height, nativeWidth, nativeHeight) &&
+                                encode2dDispatch(encoder,
+                                                 pipelines->packRgb,
+                                                 @[nativeFringe, linearSrcNative, dstBuffer, outParamsBuffer],
+                                                 request.renderWindow.width(),
+                                                 request.renderWindow.height());
+                [encoder endEncoding];
+                outputOk = ok && commitAndWait(commandBuffer, error);
+                break;
+            }
+            outputOk = encode2d(pipelines->packRgb,
+                                @[creativeFringePreview, linearSrcNative, dstBuffer, outParamsBuffer],
+                                request.renderWindow.width(),
+                                request.renderWindow.height());
+            break;
         case LensDiffDebugView::Final:
         default:
-            return finalBuffer != nil &&
-                   encode2d(pipelines->packRgb, @[finalBuffer, linearSrcNative, dstBuffer, outParamsBuffer], request.renderWindow.width(), request.renderWindow.height());
+            outputOk = finalBuffer != nil &&
+                       encode2d(pipelines->packRgb, @[finalBuffer, linearSrcNative, dstBuffer, outParamsBuffer], request.renderWindow.width(), request.renderWindow.height());
+            break;
     }
+    timing.compositeOutputMs += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                                    std::chrono::steady_clock::now() - outputStart)
+                                    .count();
+    logTimingBreakdown();
+    return outputOk;
 }
 
 #else

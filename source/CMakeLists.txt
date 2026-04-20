@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(LensDiff VERSION 0.2.0 LANGUAGES CXX)
+project(LensDiff VERSION 0.2.1 LANGUAGES CXX)
 
 set(PLUGIN_BASENAME "LensDiff")
-set(CUBE_DISPLAY_VERSION "0.2.0")
+set(CUBE_DISPLAY_VERSION "0.2.1")
 set(PLUGIN_IDENTIFIER "com.moazelgabry.LensDiff")
 set(LOCAL_OFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk")
 set(GENERATED_ASSET_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -159,6 +159,40 @@ if(APPLE)
     "-framework AppKit"
     "-framework ApplicationServices"
     "-framework ImageIO")
+
+  find_program(XCRUN_EXECUTABLE xcrun REQUIRED)
+  set(GENERATED_METAL_SOURCE "${GENERATED_ASSET_DIR}/${PLUGIN_BASENAME}Shaders.metal")
+  set(GENERATED_METAL_AIR "${GENERATED_ASSET_DIR}/${PLUGIN_BASENAME}Shaders.air")
+  set(GENERATED_METAL_LIBRARY "${GENERATED_ASSET_DIR}/${PLUGIN_BASENAME}.metallib")
+
+  add_custom_command(
+    OUTPUT "${GENERATED_METAL_SOURCE}"
+    COMMAND ${CMAKE_COMMAND}
+      -DINPUT_FILE="${CMAKE_CURRENT_SOURCE_DIR}/src/metal/LensDiffMetal.mm"
+      -DOUTPUT_FILE="${GENERATED_METAL_SOURCE}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ExtractMetalSource.cmake"
+    DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/metal/LensDiffMetal.mm"
+      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ExtractMetalSource.cmake"
+    COMMENT "Extracting Metal shader source from LensDiffMetal.mm"
+    VERBATIM)
+
+  add_custom_command(
+    OUTPUT "${GENERATED_METAL_AIR}"
+    COMMAND "${XCRUN_EXECUTABLE}" -sdk macosx metal -c "${GENERATED_METAL_SOURCE}" -o "${GENERATED_METAL_AIR}"
+    DEPENDS "${GENERATED_METAL_SOURCE}"
+    COMMENT "Compiling ${PLUGIN_BASENAME} Metal shaders"
+    VERBATIM)
+
+  add_custom_command(
+    OUTPUT "${GENERATED_METAL_LIBRARY}"
+    COMMAND "${XCRUN_EXECUTABLE}" -sdk macosx metallib "${GENERATED_METAL_AIR}" -o "${GENERATED_METAL_LIBRARY}"
+    DEPENDS "${GENERATED_METAL_AIR}"
+    COMMENT "Linking ${PLUGIN_BASENAME} Metal shader library"
+    VERBATIM)
+
+  add_custom_target(${PLUGIN_BASENAME}MetalLibrary ALL DEPENDS "${GENERATED_METAL_LIBRARY}")
+  add_dependencies(${PLUGIN_BASENAME} ${PLUGIN_BASENAME}MetalLibrary)
 endif()
 
 set_target_properties(${PLUGIN_BASENAME} PROPERTIES
@@ -235,7 +269,8 @@ if(APPLE)
   configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Info.plist.in" "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" @ONLY)
   add_custom_command(TARGET ${PLUGIN_BASENAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" "${OFX_BUNDLE_CONTENTS_DIR}/Info.plist"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${PLUGIN_BASENAME}>" "${OFX_OUTPUT_DIR}/${PLUGIN_BASENAME}.ofx")
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${PLUGIN_BASENAME}>" "${OFX_OUTPUT_DIR}/${PLUGIN_BASENAME}.ofx"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${GENERATED_METAL_LIBRARY}" "${OFX_RESOURCES_DIR}/${PLUGIN_BASENAME}.metallib")
 else()
   add_custom_command(TARGET ${PLUGIN_BASENAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${PLUGIN_BASENAME}>" "${OFX_OUTPUT_DIR}/${PLUGIN_BASENAME}.ofx")

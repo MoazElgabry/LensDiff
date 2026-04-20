@@ -53,8 +53,8 @@ constexpr const char* kPluginDescription =
 constexpr const char* kPluginIdentifier = "com.moazelgabry.LensDiff";
 constexpr int kPluginVersionMajor = 0;
 constexpr int kPluginVersionMinor = 2;
-constexpr const char* kPluginVersionLabel = "v0.2.0";
-constexpr const char* kPluginDisplayVersion = "0.2.0";
+constexpr const char* kPluginVersionLabel = "v0.2.1";
+constexpr const char* kPluginDisplayVersion = "0.2.1";
 constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
 
 constexpr bool kSupportsTiles = true;
