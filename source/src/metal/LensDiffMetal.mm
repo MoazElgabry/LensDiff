@@ -680,6 +680,7 @@ using namespace metal;
 
 constant float kGray18 = 0.18f;
 constant float kLensDiffPi = 3.14159265358979323846f;
+#define LENSDIFF_MAX_SPECTRAL_BINS 9
 
 struct DecodeParamsGpu {
     int srcWidth;
@@ -949,16 +950,16 @@ inline float3 mulSpectralMatrix(const constant float* matrix, thread const float
         return float3(bins[0]);
     }
     float3 out = float3(0.0f);
-    const int count = min(binCount, kLensDiffMaxSpectralBins);
+    const int count = min(binCount, LENSDIFF_MAX_SPECTRAL_BINS);
     for (int i = 0; i < count; ++i) {
         out.x += matrix[i] * bins[i];
-        out.y += matrix[kLensDiffMaxSpectralBins + i] * bins[i];
-        out.z += matrix[kLensDiffMaxSpectralBins * 2 + i] * bins[i];
+        out.y += matrix[LENSDIFF_MAX_SPECTRAL_BINS + i] * bins[i];
+        out.z += matrix[LENSDIFF_MAX_SPECTRAL_BINS * 2 + i] * bins[i];
     }
     return out;
 }
 
-inline float3 mapSpectral(thread const float* bins, const SpectralMapParamsGpu& params) {
+inline float3 mapSpectral(thread const float* bins, constant SpectralMapParamsGpu& params) {
     const float3 natural = mulSpectralMatrix(params.naturalMatrix, bins, params.binCount);
     const float3 styled = mulSpectralMatrix(params.styleMatrix, bins, params.binCount);
     float3 rgb = mix(natural, styled, saturateSafe(params.spectrumForce));
@@ -1242,7 +1243,7 @@ inline float apodizationWeightGpu(int mode, float radialNorm) {
     }
 }
 
-inline float evaluatePhaseWavesGpu(const PhaseRasterParamsGpu& params, float px, float py) {
+inline float evaluatePhaseWavesGpu(constant PhaseRasterParamsGpu& params, float px, float py) {
     constexpr float kZernikeDefocusNorm = 1.7320508075688772f;
     constexpr float kZernikeAstigNorm = 2.4494897427831781f;
     constexpr float kZernikeComaNorm = 2.8284271247461901f;
@@ -1491,9 +1492,9 @@ kernel void lensDiffExtractShiftedIntensityKernel(device const float2* spectrum 
     if (int(gid.x) >= params.size || int(gid.y) >= params.size) {
         return;
     }
-    const uint half = uint(params.size / 2);
-    const uint sx = (gid.x + half) % uint(params.size);
-    const uint sy = (gid.y + half) % uint(params.size);
+    const uint halfOffset = uint(params.size / 2);
+    const uint sx = (gid.x + halfOffset) % uint(params.size);
+    const uint sy = (gid.y + halfOffset) % uint(params.size);
     const float2 value = spectrum[sy * uint(params.size) + sx];
     out[gid.y * uint(params.size) + gid.x] = dot(value, value);
 }
@@ -1971,7 +1972,7 @@ kernel void lensDiffMapSpectralKernel(device const float* bin0 [[buffer(0)]],
         return;
     }
     const uint index = gid.y * uint(params.width) + gid.x;
-    float bins[kLensDiffMaxSpectralBins] = {
+    float bins[LENSDIFF_MAX_SPECTRAL_BINS] = {
         bin0[index], bin1[index], bin2[index], bin3[index], bin4[index],
         bin5[index], bin6[index], bin7[index], bin8[index]
     };
