@@ -61,7 +61,7 @@ jobs:
       - name: Verify bundle outputs
         run: |
           test -f bundle/LensDiff.ofx.bundle/Contents/Linux-x86-64/LensDiff.ofx
-          test -f bundle/LensDiff.ofx.bundle/Contents/Resources/com.moazelgabry.lensdiff.png
+          test -f bundle/LensDiff.ofx.bundle/Contents/Resources/com.moazelgabry.LensDiff.png
           if ! find build-linux \( -iname 'LensDiffCuda.cu.o' -o -iname 'LensDiffCuda.cu.obj' \) | grep -q .; then
             echo "Plugin CUDA object was not built."
             exit 1

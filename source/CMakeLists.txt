@@ -168,8 +168,8 @@ if(APPLE)
   add_custom_command(
     OUTPUT "${GENERATED_METAL_SOURCE}"
     COMMAND ${CMAKE_COMMAND}
-      -DINPUT_FILE="${CMAKE_CURRENT_SOURCE_DIR}/src/metal/LensDiffMetal.mm"
-      -DOUTPUT_FILE="${GENERATED_METAL_SOURCE}"
+      -DINPUT_FILE=${CMAKE_CURRENT_SOURCE_DIR}/src/metal/LensDiffMetal.mm
+      -DOUTPUT_FILE=${GENERATED_METAL_SOURCE}
       -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ExtractMetalSource.cmake"
     DEPENDS
       "${CMAKE_CURRENT_SOURCE_DIR}/src/metal/LensDiffMetal.mm"
