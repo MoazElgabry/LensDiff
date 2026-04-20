@@ -2216,7 +2216,7 @@ kernel void lensDiffResampleRawPsfKernel(device const float* rawPsf [[buffer(0)]
         sampleSquareFiltered(rawPsf, params.height, sx, sy, invScale);
 }
 
-kernel void lensDiffRingSumCountKernel(device const float* kernel [[buffer(0)]],
+kernel void lensDiffRingSumCountKernel(device const float* kernelValues [[buffer(0)]],
                                        device float* ringSums [[buffer(1)]],
                                        device uint* ringCounts [[buffer(2)]],
                                        constant KernelShapeParamsGpu& params [[buffer(3)]],
@@ -2233,7 +2233,7 @@ kernel void lensDiffRingSumCountKernel(device const float* kernel [[buffer(0)]],
             const float dy = float(y) - center;
             const int r = min(params.radiusMax, int(round(length(float2(dx, dy)))));
             if (r == int(gid)) {
-                sum += kernel[uint(y * params.kernelSize + x)];
+                sum += kernelValues[uint(y * params.kernelSize + x)];
                 count += 1u;
             }
         }
@@ -2285,7 +2285,7 @@ kernel void lensDiffPositiveResidualKernel(device const float* fullKernel [[buff
     residualKernel[index] = max(0.0f, fullKernel[index] - meanKernel[index]);
 }
 
-kernel void lensDiffRingEnergyPeakKernel(device const float* kernel [[buffer(0)]],
+kernel void lensDiffRingEnergyPeakKernel(device const float* kernelValues [[buffer(0)]],
                                          device float* ringEnergy [[buffer(1)]],
                                          device float* ringPeak [[buffer(2)]],
                                          constant KernelShapeParamsGpu& params [[buffer(3)]],
@@ -2302,7 +2302,7 @@ kernel void lensDiffRingEnergyPeakKernel(device const float* kernel [[buffer(0)]
             const float dy = float(y) - center;
             const int r = min(params.radiusMax, int(ceil(length(float2(dx, dy)))));
             if (r == int(gid)) {
-                const float value = kernel[uint(y * params.kernelSize + x)];
+                const float value = kernelValues[uint(y * params.kernelSize + x)];
                 energy += value;
                 peak = max(peak, value);
             }
