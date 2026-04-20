@@ -367,6 +367,9 @@ std::string nsErrorString(NSError* error) {
 }
 
 constexpr const char* kLensDiffMetalLibraryFilename = "LensDiff.metallib";
+extern std::mutex gWorkQueueMutex;
+extern id<MTLDevice> gWorkQueueDevice;
+extern id<MTLCommandQueue> gWorkQueue;
 
 std::string lensDiffBundledMetalLibraryPath() {
     Dl_info info {};
@@ -379,6 +382,28 @@ std::string lensDiffBundledMetalLibraryPath() {
         return {};
     }
     return resourcePath.string();
+}
+
+id<MTLCommandQueue> ensureWorkQueue(id<MTLDevice> device, std::string* error) {
+    if (device == nil) {
+        if (error) *error = "missing-metal-device";
+        return nil;
+    }
+
+    std::lock_guard<std::mutex> lock(gWorkQueueMutex);
+    if (gWorkQueueDevice == device && gWorkQueue != nil) {
+        return gWorkQueue;
+    }
+
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    if (queue == nil) {
+        if (error) *error = "failed-metal-work-queue";
+        return nil;
+    }
+
+    gWorkQueueDevice = device;
+    gWorkQueue = queue;
+    return gWorkQueue;
 }
 
 bool validateRowBytes(const LensDiffImageView& view) {
@@ -673,6 +698,9 @@ struct PipelineBundle {
 
 std::mutex gPipelineMutex;
 PipelineBundle gPipelines;
+std::mutex gWorkQueueMutex;
+id<MTLDevice> gWorkQueueDevice = nil;
+id<MTLCommandQueue> gWorkQueue = nil;
 
 const char* kLensDiffMetalSource = R"METAL(
 #include <metal_stdlib>
@@ -3804,15 +3832,22 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
         return false;
     }
 
-    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)request.metalCommandQueue;
+    id<MTLCommandQueue> hostQueue = (__bridge id<MTLCommandQueue>)request.metalCommandQueue;
     id<MTLBuffer> srcBuffer = (__bridge id<MTLBuffer>)request.src.data;
     id<MTLBuffer> dstBuffer = (__bridge id<MTLBuffer>)request.dst.data;
-    if (queue == nil || srcBuffer == nil || dstBuffer == nil) {
+    if (hostQueue == nil || srcBuffer == nil || dstBuffer == nil) {
         if (error) *error = "missing-metal-queue-or-buffer";
         return false;
     }
 
-    id<MTLDevice> device = queue.device;
+    id<MTLDevice> device = hostQueue.device;
+    // Resolve provides the device-facing queue, but LensDiff submits many small synchronous command
+    // buffers during PSF prep and debug/composite staging. Keep that work on our own queue so we do
+    // not block host-managed queue scheduling while still using the same device and shared buffers.
+    id<MTLCommandQueue> queue = ensureWorkQueue(device, error);
+    if (queue == nil) {
+        return false;
+    }
     PipelineBundle* pipelines = ensurePipelines(device, error);
     if (pipelines == nullptr) {
         return false;
@@ -4038,30 +4073,45 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
     const DecodeParamsGpu decodeParams {
         nativeWidth, nativeHeight, rowFloats(request.src), static_cast<int>(params.inputTransfer)};
     id<MTLBuffer> decodeParamsBuffer = makeParamBuffer(device, decodeParams, error);
-    if (decodeParamsBuffer == nil ||
-        !encode2d(pipelines->decodeSource, @[srcBuffer, linearSrcNative, decodeParamsBuffer], nativeWidth, nativeHeight)) {
-        return false;
-    }
-    if (resolutionAwareActive) {
-        const ResampleParamsGpu linearResampleParams {nativeWidth, nativeHeight, width, height};
-        id<MTLBuffer> linearResampleParamsBuffer = makeParamBuffer(device, linearResampleParams, error);
-        if (linearResampleParamsBuffer == nil ||
-            !encode2d(pipelines->resampleRgba, @[linearSrcNative, linearSrc, linearResampleParamsBuffer], width, height)) {
-            return false;
-        }
-    }
-
     const PrepareParamsGpu prepareParams {
         width, height,
         params.extractionMode == LensDiffExtractionMode::Luma ? 1 : 0,
         static_cast<float>(params.threshold), static_cast<float>(std::max(0.01, params.softnessStops)),
         static_cast<float>(params.pointEmphasis), static_cast<float>(params.corePreserve)};
     id<MTLBuffer> prepareParamsBuffer = makeParamBuffer(device, prepareParams, error);
-    if (prepareParamsBuffer == nil ||
-        !encode2d(pipelines->prepareFromLinear, @[linearSrc, redistributed, driver, mask, prepareParamsBuffer], width, height)) {
+    id<MTLBuffer> linearResampleParamsBuffer = nil;
+    if (resolutionAwareActive) {
+        const ResampleParamsGpu linearResampleParams {nativeWidth, nativeHeight, width, height};
+        linearResampleParamsBuffer = makeParamBuffer(device, linearResampleParams, error);
+    }
+    if (decodeParamsBuffer == nil || prepareParamsBuffer == nil ||
+        (resolutionAwareActive && linearResampleParamsBuffer == nil)) {
         return false;
     }
-
+    {
+        id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        const bool ok = encode2dDispatch(encoder,
+                                         pipelines->decodeSource,
+                                         @[srcBuffer, linearSrcNative, decodeParamsBuffer],
+                                         nativeWidth,
+                                         nativeHeight) &&
+                        (!resolutionAwareActive ||
+                         encode2dDispatch(encoder,
+                                          pipelines->resampleRgba,
+                                          @[linearSrcNative, linearSrc, linearResampleParamsBuffer],
+                                          width,
+                                          height)) &&
+                        encode2dDispatch(encoder,
+                                         pipelines->prepareFromLinear,
+                                         @[linearSrc, redistributed, driver, mask, prepareParamsBuffer],
+                                         width,
+                                         height);
+        [encoder endEncoding];
+        if (!ok || !commitAndWait(commandBuffer, error)) {
+            return false;
+        }
+    }
     const float redistributionScale = 1.0f - static_cast<float>(clampValue(params.corePreserve, 0.0, 1.0));
     const float protectedCoreFraction = std::max(
         kMinimumSelectedCoreFloor,

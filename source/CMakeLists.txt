@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(LensDiff VERSION 0.2.1 LANGUAGES CXX)
+project(LensDiff VERSION 0.2.2 LANGUAGES CXX)
 
 set(PLUGIN_BASENAME "LensDiff")
-set(CUBE_DISPLAY_VERSION "0.2.1")
+set(CUBE_DISPLAY_VERSION "0.2.2")
 set(PLUGIN_IDENTIFIER "com.moazelgabry.LensDiff")
 set(LOCAL_OFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk")
 set(GENERATED_ASSET_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
