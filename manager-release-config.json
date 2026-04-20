@@ -2,6 +2,7 @@
   "pluginId": "lensdiff",
   "displayName": "LensDiff",
   "releaseRepo": "MoazElgabry/LensDiff",
+  "iconSourcePath": "icons/plugin-manager.png",
   "minManagerVersion": "0.1.0",
   "hostProcesses": [
     "Resolve",
@@ -28,7 +29,7 @@
       "assetPattern": "^LensDiff_.*windows.*portable\\.zip$",
       "packageType": "zip",
       "bundleName": "LensDiff.ofx.bundle",
-      "bundleIdentifier": "com.moazelgabry.lensdiff",
+      "bundleIdentifier": "com.moazelgabry.LensDiff",
       "installPath": "C:\\Program Files\\Common Files\\OFX\\Plugins"
     },
     {
@@ -38,7 +39,7 @@
       "assetPattern": "^LensDiff_.*macOS.*portable\\.zip$",
       "packageType": "zip",
       "bundleName": "LensDiff.ofx.bundle",
-      "bundleIdentifier": "com.moazelgabry.lensdiff",
+      "bundleIdentifier": "com.moazelgabry.LensDiff",
       "installPath": "/Library/OFX/Plugins"
     },
     {
@@ -48,7 +49,7 @@
       "assetPattern": "^LensDiff_.*linux.*portable\\.(?:tar\\.gz|zip)$",
       "packageType": "tar.gz",
       "bundleName": "LensDiff.ofx.bundle",
-      "bundleIdentifier": "com.moazelgabry.lensdiff",
+      "bundleIdentifier": "com.moazelgabry.LensDiff",
       "installPath": "/usr/OFX/Plugins"
     }
   ]

@@ -4,7 +4,7 @@ project(LensDiff VERSION 0.2.0 LANGUAGES CXX)
 
 set(PLUGIN_BASENAME "LensDiff")
 set(CUBE_DISPLAY_VERSION "0.2.0")
-set(PLUGIN_IDENTIFIER "com.moazelgabry.lensdiff")
+set(PLUGIN_IDENTIFIER "com.moazelgabry.LensDiff")
 set(LOCAL_OFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk")
 set(GENERATED_ASSET_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set(COMMON_COLOR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../common/color")

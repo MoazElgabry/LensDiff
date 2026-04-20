@@ -50,7 +50,7 @@ constexpr const char* kPluginName = "LensDiff";
 constexpr const char* kPluginGrouping = "Moaz Elgabry";
 constexpr const char* kPluginDescription =
     "FFT-driven lens diffraction effect with pupil-derived PSF synthesis, policy-based highlight selection, and a CPU reference core.";
-constexpr const char* kPluginIdentifier = "com.moazelgabry.lensdiff";
+constexpr const char* kPluginIdentifier = "com.moazelgabry.LensDiff";
 constexpr int kPluginVersionMajor = 0;
 constexpr int kPluginVersionMinor = 2;
 constexpr const char* kPluginVersionLabel = "v0.2.0";
@@ -3869,7 +3869,7 @@ public:
         desc.setPluginGrouping(kPluginGrouping);
         desc.setPluginDescription(kPluginDescription);
         desc.getPropertySet().propSetString(kOfxPropIcon, "", 0, false);
-        desc.getPropertySet().propSetString(kOfxPropIcon, "com.moazelgabry.lensdiff.png", 1, false);
+        desc.getPropertySet().propSetString(kOfxPropIcon, "com.moazelgabry.LensDiff.png", 1, false);
         desc.addSupportedContext(OFX::eContextFilter);
         desc.addSupportedBitDepth(OFX::eBitDepthFloat);
         desc.setSingleInstance(false);
