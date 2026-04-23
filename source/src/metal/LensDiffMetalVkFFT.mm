@@ -74,8 +74,7 @@ bool initializePlan(id<MTLCommandBuffer> commandBuffer,
         return false;
     }
 
-    MTL::CommandBuffer* commandBufferCpp =
-        NS::Object::bridgingCast<MTL::CommandBuffer*>((__bridge const void*)commandBuffer);
+    MTL::CommandBuffer* commandBufferCpp = (__bridge MTL::CommandBuffer*)commandBuffer;
     MTL::CommandQueue* queueCpp = commandBufferCpp != nullptr ? commandBufferCpp->commandQueue() : nullptr;
     MTL::Device* deviceCpp = commandBufferCpp != nullptr ? commandBufferCpp->device() : nullptr;
     if (queueCpp == nullptr || deviceCpp == nullptr) {
@@ -164,13 +163,10 @@ bool lensDiffMetalVkFFTEncodeSquare(id<MTLCommandBuffer> commandBuffer,
         return false;
     }
 
-    MTL::Buffer* spectrumBuffer =
-        NS::Object::bridgingCast<MTL::Buffer*>((__bridge const void*)spectrum);
+    MTL::Buffer* spectrumBuffer = (__bridge MTL::Buffer*)spectrum;
     VkFFTLaunchParams launchParams {};
-    launchParams.commandBuffer =
-        NS::Object::bridgingCast<MTL::CommandBuffer*>((__bridge const void*)commandBuffer);
-    launchParams.commandEncoder =
-        NS::Object::bridgingCast<MTL::ComputeCommandEncoder*>((__bridge const void*)encoder);
+    launchParams.commandBuffer = (__bridge MTL::CommandBuffer*)commandBuffer;
+    launchParams.commandEncoder = (__bridge MTL::ComputeCommandEncoder*)encoder;
     launchParams.buffer = &spectrumBuffer;
 
     const int direction = inverse ? 1 : -1;
