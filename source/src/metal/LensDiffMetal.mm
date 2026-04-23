@@ -2693,7 +2693,8 @@ PipelineBundle* ensurePipelines(id<MTLDevice> device, std::string* error) {
     if (!bundledLibraryPath.empty()) {
         libraryMode = "precompiled";
         NSString* libraryPath = [NSString stringWithUTF8String:bundledLibraryPath.c_str()];
-        library = [device newLibraryWithFile:libraryPath error:&libraryError];
+        NSURL* libraryURL = [NSURL fileURLWithPath:libraryPath];
+        library = [device newLibraryWithURL:libraryURL error:&libraryError];
     }
     if (library == nil) {
         if (!bundledLibraryPath.empty()) {
