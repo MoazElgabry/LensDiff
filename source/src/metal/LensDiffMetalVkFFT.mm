@@ -44,11 +44,14 @@ struct CachedVkFFTPlan {
     VkFFTApplication app {};
     MTL::Buffer* configBuffer = nullptr;
     pfUINT configBufferSize = 0;
-    id<MTLBuffer> placeholder = nil;
     std::mutex mutex;
 
     ~CachedVkFFTPlan() {
         deleteVkFFT(&app);
+        if (configBuffer != nullptr) {
+            configBuffer->release();
+            configBuffer = nullptr;
+        }
     }
 };
 
@@ -71,9 +74,10 @@ bool initializePlan(id<MTLCommandBuffer> commandBuffer,
         return false;
     }
 
-    id<MTLCommandQueue> queue = [commandBuffer commandQueue];
-    id<MTLDevice> device = commandBuffer.device;
-    if (queue == nil || device == nil) {
+    MTL::CommandBuffer* commandBufferCpp = NS::Object::bridgingCast<MTL::CommandBuffer*>(commandBuffer);
+    MTL::CommandQueue* queueCpp = commandBufferCpp != nullptr ? commandBufferCpp->commandQueue() : nullptr;
+    MTL::Device* deviceCpp = commandBufferCpp != nullptr ? commandBufferCpp->device() : nullptr;
+    if (queueCpp == nullptr || deviceCpp == nullptr) {
         if (error != nullptr) {
             *error = "metal-vkfft-missing-device-or-queue";
         }
@@ -81,8 +85,8 @@ bool initializePlan(id<MTLCommandBuffer> commandBuffer,
     }
 
     const VkFFTPlanKey key {
-        reinterpret_cast<std::uintptr_t>(device),
-        reinterpret_cast<std::uintptr_t>(queue),
+        reinterpret_cast<std::uintptr_t>(deviceCpp),
+        reinterpret_cast<std::uintptr_t>(queueCpp),
         size,
         imageCount
     };
@@ -102,15 +106,13 @@ bool initializePlan(id<MTLCommandBuffer> commandBuffer,
                                    sizeof(float) * 2u;
 
     std::shared_ptr<CachedVkFFTPlan> plan = std::make_shared<CachedVkFFTPlan>();
-    plan->placeholder = [device newBufferWithLength:bufferBytes options:MTLResourceStorageModeShared];
-    if (plan->placeholder == nil) {
+    plan->configBuffer = deviceCpp->newBuffer(bufferBytes, MTL::ResourceStorageModeShared);
+    if (plan->configBuffer == nullptr) {
         if (error != nullptr) {
             *error = "metal-vkfft-placeholder-buffer-allocation-failed";
         }
         return false;
     }
-
-    plan->configBuffer = NS::Object::bridgingCast<MTL::Buffer*>(plan->placeholder);
     plan->configBufferSize = static_cast<pfUINT>(bufferBytes);
 
     VkFFTConfiguration configuration {};
@@ -119,8 +121,8 @@ bool initializePlan(id<MTLCommandBuffer> commandBuffer,
     configuration.size[1] = static_cast<pfUINT>(size);
     configuration.numberBatches = static_cast<pfUINT>(imageCount);
     configuration.normalize = 1;
-    configuration.device = NS::Object::bridgingCast<MTL::Device*>(device);
-    configuration.queue = NS::Object::bridgingCast<MTL::CommandQueue*>(queue);
+    configuration.device = deviceCpp;
+    configuration.queue = queueCpp;
     configuration.buffer = &plan->configBuffer;
     configuration.bufferSize = &plan->configBufferSize;
 

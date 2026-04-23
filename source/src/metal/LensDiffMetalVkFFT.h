@@ -2,9 +2,11 @@
 
 #if defined(__APPLE__)
 
-#import <Metal/Metal.h>
-
 #include <string>
+
+@protocol MTLCommandBuffer;
+@protocol MTLComputeCommandEncoder;
+@protocol MTLBuffer;
 
 bool lensDiffMetalVkFFTEncodeSquare(id<MTLCommandBuffer> commandBuffer,
                                     id<MTLComputeCommandEncoder> encoder,
