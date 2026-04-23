@@ -167,6 +167,7 @@ if(APPLE)
     "-framework QuartzCore"
     "-framework AppKit"
     "-framework ApplicationServices"
+    "-framework UniformTypeIdentifiers"
     "-framework ImageIO")
   target_compile_options(${PLUGIN_BASENAME} PRIVATE
     $<$<COMPILE_LANGUAGE:OBJC>:-fobjc-arc>

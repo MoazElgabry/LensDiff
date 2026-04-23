@@ -3,6 +3,7 @@
 #if defined(__APPLE__)
 
 #import <AppKit/AppKit.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 bool OpenLensDiffApertureFileDialog(std::string* outPath, std::string* error) {
     if (outPath == nullptr) {
@@ -17,7 +18,14 @@ bool OpenLensDiffApertureFileDialog(std::string* outPath, std::string* error) {
     [panel setCanChooseDirectories:NO];
     [panel setAllowsMultipleSelection:NO];
     [panel setTitle:@"Select Custom Aperture"];
-    [panel setAllowedFileTypes:@[@"png", @"jpg", @"jpeg", @"tif", @"tiff", @"bmp", @"gif", @"webp"]];
+    [panel setAllowedContentTypes:@[
+        UTTypePNG,
+        UTTypeJPEG,
+        UTTypeTIFF,
+        UTTypeBMP,
+        UTTypeGIF,
+        UTTypeWebP
+    ]];
 
     if ([panel runModal] != NSModalResponseOK) {
         return false;
