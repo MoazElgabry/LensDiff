@@ -1,0 +1,182 @@
+#if defined(__APPLE__)
+
+#include "LensDiffMetalVkFFT.h"
+
+#ifndef VKFFT_BACKEND
+#define VKFFT_BACKEND 5
+#endif
+
+#include "../../external/VkFFT/vkFFT/vkFFT.h"
+
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+
+namespace {
+
+struct VkFFTPlanKey {
+    std::uintptr_t device = 0;
+    std::uintptr_t queue = 0;
+    int size = 0;
+    int imageCount = 0;
+
+    bool operator==(const VkFFTPlanKey& other) const {
+        return device == other.device &&
+               queue == other.queue &&
+               size == other.size &&
+               imageCount == other.imageCount;
+    }
+};
+
+struct VkFFTPlanKeyHasher {
+    std::size_t operator()(const VkFFTPlanKey& key) const noexcept {
+        std::size_t hash = key.device;
+        hash = hash * 1315423911u + key.queue;
+        hash = hash * 2654435761u + static_cast<std::size_t>(key.size);
+        hash = hash * 2246822519u + static_cast<std::size_t>(key.imageCount);
+        return hash;
+    }
+};
+
+struct CachedVkFFTPlan {
+    VkFFTApplication app {};
+    MTL::Buffer* configBuffer = nullptr;
+    pfUINT configBufferSize = 0;
+    id<MTLBuffer> placeholder = nil;
+    std::mutex mutex;
+
+    ~CachedVkFFTPlan() {
+        deleteVkFFT(&app);
+    }
+};
+
+std::mutex gVkFFTPlanMutex;
+std::unordered_map<VkFFTPlanKey, std::shared_ptr<CachedVkFFTPlan>, VkFFTPlanKeyHasher> gVkFFTPlans;
+
+std::string vkfftResultText(VkFFTResult result) {
+    return std::string(getVkFFTErrorString(result));
+}
+
+bool initializePlan(id<MTLCommandBuffer> commandBuffer,
+                    int size,
+                    int imageCount,
+                    std::shared_ptr<CachedVkFFTPlan>* outPlan,
+                    std::string* error) {
+    if (commandBuffer == nil || outPlan == nullptr || size <= 0 || imageCount <= 0) {
+        if (error != nullptr) {
+            *error = "metal-vkfft-invalid-init";
+        }
+        return false;
+    }
+
+    id<MTLCommandQueue> queue = [commandBuffer commandQueue];
+    id<MTLDevice> device = commandBuffer.device;
+    if (queue == nil || device == nil) {
+        if (error != nullptr) {
+            *error = "metal-vkfft-missing-device-or-queue";
+        }
+        return false;
+    }
+
+    const VkFFTPlanKey key {
+        reinterpret_cast<std::uintptr_t>(device),
+        reinterpret_cast<std::uintptr_t>(queue),
+        size,
+        imageCount
+    };
+
+    {
+        std::lock_guard<std::mutex> lock(gVkFFTPlanMutex);
+        auto it = gVkFFTPlans.find(key);
+        if (it != gVkFFTPlans.end()) {
+            *outPlan = it->second;
+            return true;
+        }
+    }
+
+    const NSUInteger bufferBytes = static_cast<NSUInteger>(size) *
+                                   static_cast<NSUInteger>(size) *
+                                   static_cast<NSUInteger>(imageCount) *
+                                   sizeof(float) * 2u;
+
+    std::shared_ptr<CachedVkFFTPlan> plan = std::make_shared<CachedVkFFTPlan>();
+    plan->placeholder = [device newBufferWithLength:bufferBytes options:MTLResourceStorageModeShared];
+    if (plan->placeholder == nil) {
+        if (error != nullptr) {
+            *error = "metal-vkfft-placeholder-buffer-allocation-failed";
+        }
+        return false;
+    }
+
+    plan->configBuffer = NS::Object::bridgingCast<MTL::Buffer*>(plan->placeholder);
+    plan->configBufferSize = static_cast<pfUINT>(bufferBytes);
+
+    VkFFTConfiguration configuration {};
+    configuration.FFTdim = 2;
+    configuration.size[0] = static_cast<pfUINT>(size);
+    configuration.size[1] = static_cast<pfUINT>(size);
+    configuration.numberBatches = static_cast<pfUINT>(imageCount);
+    configuration.normalize = 1;
+    configuration.device = NS::Object::bridgingCast<MTL::Device*>(device);
+    configuration.queue = NS::Object::bridgingCast<MTL::CommandQueue*>(queue);
+    configuration.buffer = &plan->configBuffer;
+    configuration.bufferSize = &plan->configBufferSize;
+
+    const VkFFTResult result = initializeVkFFT(&plan->app, configuration);
+    if (result != VKFFT_SUCCESS) {
+        if (error != nullptr) {
+            *error = "metal-vkfft-init-failed:" + vkfftResultText(result);
+        }
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(gVkFFTPlanMutex);
+        auto [it, inserted] = gVkFFTPlans.emplace(key, plan);
+        *outPlan = inserted ? plan : it->second;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool lensDiffMetalVkFFTEncodeSquare(id<MTLCommandBuffer> commandBuffer,
+                                    id<MTLComputeCommandEncoder> encoder,
+                                    id<MTLBuffer> spectrum,
+                                    int size,
+                                    int imageCount,
+                                    bool inverse,
+                                    std::string* error) {
+    if (commandBuffer == nil || encoder == nil || spectrum == nil || size <= 0 || imageCount <= 0) {
+        if (error != nullptr) {
+            *error = "metal-vkfft-invalid-execute";
+        }
+        return false;
+    }
+
+    std::shared_ptr<CachedVkFFTPlan> plan;
+    if (!initializePlan(commandBuffer, size, imageCount, &plan, error)) {
+        return false;
+    }
+
+    MTL::Buffer* spectrumBuffer = NS::Object::bridgingCast<MTL::Buffer*>(spectrum);
+    VkFFTLaunchParams launchParams {};
+    launchParams.commandBuffer = NS::Object::bridgingCast<MTL::CommandBuffer*>(commandBuffer);
+    launchParams.commandEncoder = NS::Object::bridgingCast<MTL::ComputeCommandEncoder*>(encoder);
+    launchParams.buffer = &spectrumBuffer;
+
+    const int direction = inverse ? 1 : -1;
+    std::lock_guard<std::mutex> lock(plan->mutex);
+    const VkFFTResult result = VkFFTAppend(&plan->app, direction, &launchParams);
+    if (result != VKFFT_SUCCESS) {
+        if (error != nullptr) {
+            *error = "metal-vkfft-append-failed:" + vkfftResultText(result);
+        }
+        return false;
+    }
+    return true;
+}
+
+#endif

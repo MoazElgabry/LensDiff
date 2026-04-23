@@ -4,6 +4,7 @@
 #include "core/LensDiffApertureImage.h"
 #include "core/LensDiffFileDialog.h"
 #include "core/LensDiffCpuReference.h"
+#include "core/LensDiffDiagnostics.h"
 #include "core/LensDiffPhase.h"
 #include "core/LensDiffTypes.h"
 #include "cuda/LensDiffCuda.h"
@@ -53,8 +54,8 @@ constexpr const char* kPluginDescription =
 constexpr const char* kPluginIdentifier = "com.moazelgabry.LensDiff";
 constexpr int kPluginVersionMajor = 0;
 constexpr int kPluginVersionMinor = 2;
-constexpr const char* kPluginVersionLabel = "v0.2.3";
-constexpr const char* kPluginDisplayVersion = "0.2.3";
+constexpr const char* kPluginVersionLabel = "v0.2.4";
+constexpr const char* kPluginDisplayVersion = "0.2.4";
 constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
 
 constexpr bool kSupportsTiles = true;
@@ -251,6 +252,17 @@ int lensdiffShortSidePx(const OfxRectD& rect, const OfxPointD& renderScale) {
     const double width = std::max(0.0, rect.x2 - rect.x1) * std::max(0.0, renderScale.x);
     const double height = std::max(0.0, rect.y2 - rect.y1) * std::max(0.0, renderScale.y);
     return std::max(1, static_cast<int>(std::ceil(std::min(width, height))));
+}
+
+LensDiffImageRect lensdiffScaledImageRect(const OfxRectD& rect, const OfxPointD& renderScale) {
+    const double scaleX = std::max(0.0, renderScale.x);
+    const double scaleY = std::max(0.0, renderScale.y);
+    return {
+        static_cast<int>(std::floor(rect.x1 * scaleX)),
+        static_cast<int>(std::floor(rect.y1 * scaleY)),
+        static_cast<int>(std::ceil(rect.x2 * scaleX)),
+        static_cast<int>(std::ceil(rect.y2 * scaleY)),
+    };
 }
 
 double normalizePhaseCoefficient(double value, double normalization) {
@@ -1933,12 +1945,7 @@ const char* inputTransferName(LensDiffInputTransfer transfer) {
 }
 
 bool envFlagEnabled(const char* name) {
-    const char* value = std::getenv(name);
-    if (value == nullptr || *value == '\0') {
-        return false;
-    }
-    const std::string text(value);
-    return text != "0" && text != "false" && text != "FALSE" && text != "off" && text != "OFF";
+    return LensDiffEnvFlagEnabled(name);
 }
 
 void logLensDiffRender(bool includeTiming,
@@ -1951,6 +1958,8 @@ void logLensDiffRender(bool includeTiming,
     ss << "[LensDiff] backend=" << backendName(backend)
        << " renderWindow=(" << request.renderWindow.x1 << "," << request.renderWindow.y1 << ")-("
        << request.renderWindow.x2 << "," << request.renderWindow.y2 << ")"
+       << " frameBounds=(" << request.frameBounds.x1 << "," << request.frameBounds.y1 << ")-("
+       << request.frameBounds.x2 << "," << request.frameBounds.y2 << ")"
        << " srcBounds=(" << request.src.bounds.x1 << "," << request.src.bounds.y1 << ")-("
        << request.src.bounds.x2 << "," << request.src.bounds.y2 << ")"
        << " dstBounds=(" << request.dst.bounds.x1 << "," << request.dst.bounds.y1 << ")-("
@@ -1971,8 +1980,9 @@ void logLensDiffRender(bool includeTiming,
     if (includeTiming) {
         ss << " elapsedMs=" << elapsedMs;
     }
-    ss << "\n";
-    OFX::Log::print("%s", ss.str().c_str());
+    const std::string line = ss.str();
+    OFX::Log::print("%s\n", line.c_str());
+    WriteLensDiffDiagnosticLine(line);
 }
 
 class LensDiffEffect : public OFX::ImageEffect {
@@ -2302,6 +2312,8 @@ private:
 
     mutable std::mutex cacheMutex_;
     mutable LensDiffPsfBankCache cache_ {};
+    mutable std::uint64_t cacheLatestStartedGeneration_ = 0;
+    mutable std::uint64_t cacheLatestCommittedGeneration_ = 0;
 };
 
 bool lensdiffPresetSelectionsEqual(const LensDiffEffect::LensDiffPresetSelection& a,
@@ -3779,6 +3791,7 @@ void LensDiffEffect::render(const OFX::RenderArguments& args) {
 
     LensDiffRenderRequest request {};
     request.renderWindow = {args.renderWindow.x1, args.renderWindow.y1, args.renderWindow.x2, args.renderWindow.y2};
+    request.frameBounds = lensdiffScaledImageRect(dstClip_->getRegionOfDefinition(args.time), args.renderScale);
     request.src = makeImageView(src.get());
     request.dst = makeImageView(dst.get());
     request.hostEnabledCudaRender = args.isEnabledCudaRender;
@@ -3800,7 +3813,6 @@ void LensDiffEffect::render(const OFX::RenderArguments& args) {
     LensDiffBackendType executedBackend = LensDiffBackendType::Auto;
     std::string note;
     const bool cpuOnlyPhaseSuite = lensdiffNeedsCpuOnlyPhaseSuite(params);
-
     std::lock_guard<std::mutex> lock(cacheMutex_);
     const bool cpuFallbackAllowed =
         cpuOnlyPhaseSuite || (!request.hostEnabledCudaRender && !request.hostEnabledMetalRender);

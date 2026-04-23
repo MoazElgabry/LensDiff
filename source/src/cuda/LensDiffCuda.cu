@@ -11,10 +11,18 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <complex>
+#include <cstdlib>
 #include <cstdint>
+#include <iterator>
+#include <memory>
+#include <mutex>
+#include <sstream>
 #include <string>
+#include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -35,6 +43,27 @@ template <typename T>
 struct DeviceBuffer {
     T* ptr = nullptr;
     std::size_t count = 0;
+
+    DeviceBuffer() = default;
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+    DeviceBuffer(DeviceBuffer&& other) noexcept
+        : ptr(other.ptr), count(other.count) {
+        other.ptr = nullptr;
+        other.count = 0;
+    }
+
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+        if (this != &other) {
+            release();
+            ptr = other.ptr;
+            count = other.count;
+            other.ptr = nullptr;
+            other.count = 0;
+        }
+        return *this;
+    }
 
     ~DeviceBuffer() { release(); }
 
@@ -92,6 +121,440 @@ struct KernelStatsHost {
     std::vector<int> counts;
     std::vector<float> ringEnergy;
     std::vector<float> ringPeak;
+};
+
+enum class CudaPlanLayoutKind : int {
+    Single2D = 0,
+    Batched2D = 1,
+};
+
+struct CudaPlanKey {
+    int width = 0;
+    int height = 0;
+    int batchCount = 0;
+    int layoutKind = 0;
+
+    bool operator==(const CudaPlanKey& other) const {
+        return width == other.width &&
+               height == other.height &&
+               batchCount == other.batchCount &&
+               layoutKind == other.layoutKind;
+    }
+};
+
+struct CudaPlanKeyHasher {
+    std::size_t operator()(const CudaPlanKey& key) const noexcept {
+        std::size_t hash = static_cast<std::size_t>(key.width);
+        hash = hash * 1315423911u + static_cast<std::size_t>(key.height);
+        hash = hash * 2654435761u + static_cast<std::size_t>(key.batchCount);
+        hash = hash * 2246822519u + static_cast<std::size_t>(key.layoutKind);
+        return hash;
+    }
+};
+
+struct CudaPsfBuildContext {
+    DeviceBuffer<float> rawPsf;
+    DeviceBuffer<float> baseKernel;
+    DeviceBuffer<float> meanKernel;
+    DeviceBuffer<float> shapedKernel;
+    DeviceBuffer<float> structureKernel;
+    DeviceBuffer<float> ringSums;
+    DeviceBuffer<int> ringCounts;
+    DeviceBuffer<float> ringEnergy;
+    DeviceBuffer<float> ringPeak;
+    DeviceBuffer<float> cropCore;
+    DeviceBuffer<float> cropFull;
+    DeviceBuffer<float> cropStructure;
+    DeviceBuffer<float> reductionScalarA;
+    DeviceBuffer<float> reductionScalarB;
+    DeviceBuffer<float> scalarScale;
+    DeviceBuffer<float> totalEnergy;
+    DeviceBuffer<float> globalPeak;
+};
+
+struct PersistentCudaPlanRepository {
+    struct PlanEntry {
+        cufftHandle handle = 0;
+        DeviceBuffer<unsigned char> workspace;
+        std::size_t workBytes = 0;
+        bool inUse = false;
+        std::uint64_t stamp = 0;
+        cudaEvent_t readyEvent = nullptr;
+
+        ~PlanEntry() {
+            if (handle != 0) {
+                cufftDestroy(handle);
+                handle = 0;
+            }
+            if (readyEvent != nullptr) {
+                cudaEventDestroy(readyEvent);
+                readyEvent = nullptr;
+            }
+        }
+    };
+
+    std::mutex mutex;
+    std::unordered_map<CudaPlanKey, std::vector<std::unique_ptr<PlanEntry>>, CudaPlanKeyHasher> entries;
+    std::uint64_t nextStamp = 0;
+};
+
+struct CudaPlanLease {
+    PersistentCudaPlanRepository* repository = nullptr;
+    PersistentCudaPlanRepository::PlanEntry* entry = nullptr;
+    cufftHandle standaloneHandle = 0;
+    cudaStream_t releaseStream = nullptr;
+
+    CudaPlanLease() = default;
+    CudaPlanLease(const CudaPlanLease&) = delete;
+    CudaPlanLease& operator=(const CudaPlanLease&) = delete;
+
+    CudaPlanLease(CudaPlanLease&& other) noexcept
+        : repository(other.repository),
+          entry(other.entry),
+          standaloneHandle(other.standaloneHandle),
+          releaseStream(other.releaseStream) {
+        other.repository = nullptr;
+        other.entry = nullptr;
+        other.standaloneHandle = 0;
+        other.releaseStream = nullptr;
+    }
+
+    CudaPlanLease& operator=(CudaPlanLease&& other) noexcept {
+        if (this != &other) {
+            release();
+            repository = other.repository;
+            entry = other.entry;
+            standaloneHandle = other.standaloneHandle;
+            releaseStream = other.releaseStream;
+            other.repository = nullptr;
+            other.entry = nullptr;
+            other.standaloneHandle = 0;
+            other.releaseStream = nullptr;
+        }
+        return *this;
+    }
+
+    ~CudaPlanLease() { release(); }
+
+    cufftHandle handle() const { return entry != nullptr ? entry->handle : standaloneHandle; }
+    std::size_t workBytes() const { return entry != nullptr ? entry->workBytes : 0; }
+
+    void release() {
+        if (standaloneHandle != 0) {
+            cufftDestroy(standaloneHandle);
+            standaloneHandle = 0;
+        }
+        if (repository == nullptr || entry == nullptr) {
+            releaseStream = nullptr;
+            return;
+        }
+        if (entry->readyEvent != nullptr && releaseStream != nullptr) {
+            cudaEventRecord(entry->readyEvent, releaseStream);
+        }
+        std::lock_guard<std::mutex> lock(repository->mutex);
+        entry->inUse = false;
+        repository = nullptr;
+        entry = nullptr;
+        releaseStream = nullptr;
+    }
+};
+
+struct CudaRenderTimingBreakdown {
+    double psfBankMs = 0.0;
+    double sourceFftMs = 0.0;
+    double kernelFftMs = 0.0;
+    double convolutionMs = 0.0;
+    double fieldZonesMs = 0.0;
+    double scatterMs = 0.0;
+    double creativeFringeMs = 0.0;
+    double nativeResampleMs = 0.0;
+    double compositeMs = 0.0;
+    double outputCopyMs = 0.0;
+    int planCacheHits = 0;
+    int planCacheMisses = 0;
+    int rgbSourceCacheHits = 0;
+    int rgbSourceCacheMisses = 0;
+    int scalarSourceCacheHits = 0;
+    int scalarSourceCacheMisses = 0;
+    int kernelCacheHits = 0;
+    int kernelCacheMisses = 0;
+    int fieldZoneBatchDepth = 0;
+    int hostSyncCount = 0;
+    std::size_t maxPlanWorkBytes = 0;
+    std::uint64_t fieldScratchEstimateBytes = 0;
+    std::uint64_t fieldKeyHash = 0;
+    std::uint64_t psfKeyHash = 0;
+    double validationMs = 0.0;
+    float validationEffectMaxAbs = 0.0f;
+    float validationCoreMaxAbs = 0.0f;
+    float validationStructureMaxAbs = 0.0f;
+    bool validationEnabled = false;
+    bool validationRan = false;
+    bool validationReferenceLegacy = false;
+    std::string validationNote;
+    std::string fieldBranch;
+    std::string fieldWeightSpace;
+};
+
+struct CudaRenderContext {
+    cudaStream_t stream = nullptr;
+    PersistentCudaPlanRepository* planRepository = nullptr;
+    CudaRenderTimingBreakdown* timing = nullptr;
+    std::string* error = nullptr;
+};
+
+std::uint64_t hashBytesFnv1a64(const void* data, std::size_t byteCount) {
+    const auto* bytes = static_cast<const std::uint8_t*>(data);
+    std::uint64_t hash = 1469598103934665603ull;
+    for (std::size_t index = 0; index < byteCount; ++index) {
+        hash ^= static_cast<std::uint64_t>(bytes[index]);
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+std::string persistentKernelSpectrumCacheKey(int deviceId,
+                                             const LensDiffKernel& kernel,
+                                             int paddedWidth,
+                                             int paddedHeight) {
+    const std::uint64_t valueHash =
+        hashBytesFnv1a64(kernel.values.data(), kernel.values.size() * sizeof(float));
+    return std::to_string(deviceId) + ":" +
+           std::to_string(kernel.size) + ":" +
+           std::to_string(kernel.values.size()) + ":" +
+           std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) + ":" +
+           std::to_string(static_cast<unsigned long long>(valueHash));
+}
+
+struct PersistentCudaKernelSpectrumCache {
+    struct Entry {
+        std::shared_ptr<DeviceBuffer<cufftComplex>> spectrum;
+        std::size_t bytes = 0;
+        std::uint64_t stamp = 0;
+        cudaEvent_t readyEvent = nullptr;
+
+        Entry() = default;
+        Entry(const Entry&) = delete;
+        Entry& operator=(const Entry&) = delete;
+
+        Entry(Entry&& other) noexcept
+            : spectrum(std::move(other.spectrum)),
+              bytes(other.bytes),
+              stamp(other.stamp),
+              readyEvent(other.readyEvent) {
+            other.bytes = 0;
+            other.stamp = 0;
+            other.readyEvent = nullptr;
+        }
+
+        Entry& operator=(Entry&& other) noexcept {
+            if (this != &other) {
+                release();
+                spectrum = std::move(other.spectrum);
+                bytes = other.bytes;
+                stamp = other.stamp;
+                readyEvent = other.readyEvent;
+                other.bytes = 0;
+                other.stamp = 0;
+                other.readyEvent = nullptr;
+            }
+            return *this;
+        }
+
+        ~Entry() { release(); }
+
+        void release() {
+            if (readyEvent != nullptr) {
+                cudaEventDestroy(readyEvent);
+                readyEvent = nullptr;
+            }
+        }
+    };
+
+    std::mutex mutex;
+    std::unordered_map<std::string, Entry> entries;
+    std::size_t totalBytes = 0;
+    std::uint64_t nextStamp = 0;
+};
+
+PersistentCudaKernelSpectrumCache& persistentCudaKernelSpectrumCache() {
+    static PersistentCudaKernelSpectrumCache cache;
+    return cache;
+}
+
+PersistentCudaPlanRepository& persistentCudaPlanRepository() {
+    static PersistentCudaPlanRepository repository;
+    return repository;
+}
+
+bool LensDiffCudaFieldValidateEnabled() {
+    const char* value = std::getenv("LENSDIFF_CUDA_FIELD_VALIDATE");
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    const std::string text(value);
+    return text != "0" && text != "false" && text != "FALSE" && text != "off" && text != "OFF";
+}
+
+bool LensDiffCudaUseFrameWeightSpace() {
+    const char* value = std::getenv("LENSDIFF_CUDA_FIELD_WEIGHT_SPACE");
+    if (value == nullptr || *value == '\0') {
+        return true;
+    }
+    const std::string text(value);
+    if (text == "working" || text == "WORKING" || text == "Working") {
+        return false;
+    }
+    return true;
+}
+
+bool LensDiffCudaExperimentalTiledFieldEnabled() {
+    const char* value = std::getenv("LENSDIFF_CUDA_FIELD_TILED");
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    const std::string text(value);
+    return text != "0" && text != "false" && text != "FALSE" && text != "off" && text != "OFF";
+}
+
+bool LensDiffCudaExperimentalStackedFieldEnabled() {
+    const char* value = std::getenv("LENSDIFF_CUDA_FIELD_STACKED");
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    const std::string text(value);
+    return text != "0" && text != "false" && text != "FALSE" && text != "off" && text != "OFF";
+}
+
+bool LensDiffCudaPersistentKernelCacheEnabled() {
+    const char* value = std::getenv("LENSDIFF_CUDA_PERSISTENT_KERNEL_CACHE");
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    const std::string text(value);
+    return text != "0" && text != "false" && text != "FALSE" && text != "off" && text != "OFF";
+}
+
+bool LensDiffCudaBatchedFieldCacheEnabled() {
+    const char* value = std::getenv("LENSDIFF_CUDA_BATCHED_FIELD_CACHE");
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    const std::string text(value);
+    return text != "0" && text != "false" && text != "FALSE" && text != "off" && text != "OFF";
+}
+
+std::uint64_t hashStringFnv1a64(const std::string& text) {
+    return hashBytesFnv1a64(text.data(), text.size());
+}
+
+template <typename T>
+void hashAppendValue(std::ostringstream& os, const T& value) {
+    if constexpr (std::is_enum_v<T>) {
+        os << static_cast<int>(value) << '|';
+    } else {
+        os << value << '|';
+    }
+}
+
+std::uint64_t diagnosticFieldKeyHash(const LensDiffFieldKey& key) {
+    std::ostringstream os;
+    hashAppendValue(os, key.phaseFieldStrength);
+    hashAppendValue(os, key.phaseFieldEdgeBias);
+    hashAppendValue(os, key.phaseFieldDefocus);
+    hashAppendValue(os, key.phaseFieldAstigRadial);
+    hashAppendValue(os, key.phaseFieldAstigTangential);
+    hashAppendValue(os, key.phaseFieldComaRadial);
+    hashAppendValue(os, key.phaseFieldComaTangential);
+    hashAppendValue(os, key.phaseFieldSpherical);
+    hashAppendValue(os, key.phaseFieldTrefoilRadial);
+    hashAppendValue(os, key.phaseFieldTrefoilTangential);
+    hashAppendValue(os, key.phaseFieldSecondaryAstigRadial);
+    hashAppendValue(os, key.phaseFieldSecondaryAstigTangential);
+    hashAppendValue(os, key.phaseFieldQuadrafoilRadial);
+    hashAppendValue(os, key.phaseFieldQuadrafoilTangential);
+    hashAppendValue(os, key.phaseFieldSecondaryComaRadial);
+    hashAppendValue(os, key.phaseFieldSecondaryComaTangential);
+    return hashStringFnv1a64(os.str());
+}
+
+std::uint64_t diagnosticPsfKeyHash(const LensDiffPsfBankKey& key) {
+    std::ostringstream os;
+    hashAppendValue(os, key.apertureMode);
+    hashAppendValue(os, key.apodizationMode);
+    hashAppendValue(os, key.spectralMode);
+    hashAppendValue(os, key.bladeCount);
+    hashAppendValue(os, key.vaneCount);
+    hashAppendValue(os, key.pupilResolution);
+    hashAppendValue(os, key.frameShortSidePx);
+    hashAppendValue(os, key.maxKernelRadiusPx);
+    hashAppendValue(os, key.customAperturePath);
+    hashAppendValue(os, key.customApertureNormalize);
+    hashAppendValue(os, key.customApertureInvert);
+    hashAppendValue(os, key.roundness);
+    hashAppendValue(os, key.rotationDeg);
+    hashAppendValue(os, key.centralObstruction);
+    hashAppendValue(os, key.vaneThickness);
+    hashAppendValue(os, key.diffractionScalePx);
+    hashAppendValue(os, key.anisotropyEmphasis);
+    hashAppendValue(os, key.phaseDefocus);
+    hashAppendValue(os, key.phaseAstigmatism0);
+    hashAppendValue(os, key.phaseAstigmatism45);
+    hashAppendValue(os, key.phaseComaX);
+    hashAppendValue(os, key.phaseComaY);
+    hashAppendValue(os, key.phaseSpherical);
+    hashAppendValue(os, key.phaseTrefoilX);
+    hashAppendValue(os, key.phaseTrefoilY);
+    hashAppendValue(os, key.phaseSecondaryAstigmatism0);
+    hashAppendValue(os, key.phaseSecondaryAstigmatism45);
+    hashAppendValue(os, key.phaseQuadrafoil0);
+    hashAppendValue(os, key.phaseQuadrafoil45);
+    hashAppendValue(os, key.phaseSecondaryComaX);
+    hashAppendValue(os, key.phaseSecondaryComaY);
+    hashAppendValue(os, key.pupilDecenterX);
+    hashAppendValue(os, key.pupilDecenterY);
+    hashAppendValue(os, key.chromaticFocus);
+    hashAppendValue(os, key.chromaticSpread);
+    return hashStringFnv1a64(os.str());
+}
+
+enum class FieldEffectKind : int {
+    Full = 0,
+    Core = 1,
+    Structure = 2,
+};
+
+struct FieldZoneBatchPlan {
+    std::vector<const LensDiffFieldZoneCache*> zones;
+    LensDiffFieldKey fieldKey {};
+    bool canonical3x3 = false;
+};
+
+struct FieldZoneSpectrumStacks {
+    int paddedWidth = 0;
+    int paddedHeight = 0;
+    int zoneCount = 0;
+    int spectralBinCount = 0;
+    FieldEffectKind effectKind = FieldEffectKind::Full;
+    DeviceBuffer<cufftComplex> spectrumStack;
+};
+
+struct StackImageParamsCuda {
+    int pixelCount = 0;
+    int stackDepth = 0;
+};
+
+struct ZonePlaneStackParamsCuda {
+    int pixelCount = 0;
+    int zoneCount = 0;
+    int binCount = 0;
+};
+
+struct ZonePlaneAccumulateParamsCuda {
+    int pixelCount = 0;
+    int zoneCount = 0;
+    int binCount = 0;
+    int binIndex = 0;
 };
 
 struct PupilRasterParamsCuda {
@@ -382,6 +845,34 @@ __global__ void padRealToComplexKernel(const float* src,
     float value = 0.0f;
     if (x < width && y < height) {
         value = src[static_cast<std::size_t>(y) * width + x];
+    }
+    dst[index].x = value;
+    dst[index].y = 0.0f;
+}
+
+__global__ void padRealWindowToComplexKernel(const float* src,
+                                             int srcWidth,
+                                             int srcHeight,
+                                             int windowX,
+                                             int windowY,
+                                             int windowWidth,
+                                             int windowHeight,
+                                             int paddedWidth,
+                                             int paddedHeight,
+                                             cufftComplex* dst) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= paddedWidth || y >= paddedHeight) {
+        return;
+    }
+    const std::size_t index = static_cast<std::size_t>(y) * paddedWidth + x;
+    float value = 0.0f;
+    if (x < windowWidth && y < windowHeight) {
+        const int srcX = windowX + x;
+        const int srcY = windowY + y;
+        if (srcX >= 0 && srcX < srcWidth && srcY >= 0 && srcY < srcHeight) {
+            value = src[static_cast<std::size_t>(srcY) * srcWidth + srcX];
+        }
     }
     dst[index].x = value;
     dst[index].y = 0.0f;
@@ -1013,6 +1504,16 @@ __global__ void reduceSumKernel(const float* values,
     atomicAdd(outSum, values[index]);
 }
 
+__global__ void reduceScalarSumKernel(const float* values,
+                                      std::size_t count,
+                                      float* outSum) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= count) {
+        return;
+    }
+    atomicAdd(outSum, values[index]);
+}
+
 __global__ void extractShiftedIntensityKernel(const cufftComplex* spectrum,
                                               int size,
                                               float* shiftedIntensity) {
@@ -1043,6 +1544,38 @@ __global__ void multiplySpectraKernel(const cufftComplex* a,
     out[index].y = av.x * bv.y + av.y * bv.x;
 }
 
+__global__ void multiplyComplexPairsStackKernel(const cufftComplex* a,
+                                                const cufftComplex* b,
+                                                cufftComplex* out,
+                                                std::size_t countPerSlice,
+                                                int sliceCount) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t totalCount = countPerSlice * static_cast<std::size_t>(max(0, sliceCount));
+    if (index >= totalCount) {
+        return;
+    }
+    const cufftComplex av = a[index];
+    const cufftComplex bv = b[index];
+    out[index].x = av.x * bv.x - av.y * bv.y;
+    out[index].y = av.x * bv.y + av.y * bv.x;
+}
+
+__global__ void replicateComplexStackKernel(const cufftComplex* src,
+                                            int srcSliceCount,
+                                            int dstSliceCount,
+                                            std::size_t countPerSlice,
+                                            cufftComplex* dst) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t totalCount = countPerSlice * static_cast<std::size_t>(max(0, dstSliceCount));
+    if (index >= totalCount) {
+        return;
+    }
+    const int sliceIndex = static_cast<int>(index / countPerSlice);
+    const std::size_t sliceOffset = index % countPerSlice;
+    const int srcSlice = srcSliceCount > 0 ? sliceIndex % srcSliceCount : 0;
+    dst[index] = src[static_cast<std::size_t>(srcSlice) * countPerSlice + sliceOffset];
+}
+
 __global__ void extractRealKernel(const cufftComplex* spectrum,
                                   int width,
                                   int height,
@@ -1060,6 +1593,48 @@ __global__ void extractRealKernel(const cufftComplex* spectrum,
     out[outIndex] = fmaxf(0.0f, spectrum[srcIndex].x * scale);
 }
 
+__global__ void extractRealStackKernel(const cufftComplex* spectrum,
+                                       int width,
+                                       int height,
+                                       int paddedWidth,
+                                       std::size_t countPerSlice,
+                                       int sliceCount,
+                                       float scale,
+                                       float* out) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t pixelCount = static_cast<std::size_t>(width) * height;
+    const std::size_t totalCount = pixelCount * static_cast<std::size_t>(max(0, sliceCount));
+    if (index >= totalCount) {
+        return;
+    }
+    const int sliceIndex = static_cast<int>(index / pixelCount);
+    const std::size_t pixelOffset = index % pixelCount;
+    const int x = static_cast<int>(pixelOffset % static_cast<std::size_t>(width));
+    const int y = static_cast<int>(pixelOffset / static_cast<std::size_t>(width));
+    const std::size_t srcIndex = static_cast<std::size_t>(sliceIndex) * countPerSlice +
+                                 static_cast<std::size_t>(y) * paddedWidth + static_cast<std::size_t>(x);
+    out[index] = fmaxf(0.0f, spectrum[srcIndex].x * scale);
+}
+
+__global__ void packPlaneTripletsToRgbStackKernel(const float* planeStack,
+                                                  std::size_t pixelCount,
+                                                  int zoneCount,
+                                                  float* outR,
+                                                  float* outG,
+                                                  float* outB) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t totalCount = pixelCount * static_cast<std::size_t>(max(0, zoneCount));
+    if (index >= totalCount) {
+        return;
+    }
+    const int zoneIndex = static_cast<int>(index / pixelCount);
+    const std::size_t pixelOffset = index % pixelCount;
+    const std::size_t stackBase = static_cast<std::size_t>(zoneIndex) * pixelCount * 3U;
+    outR[index] = planeStack[stackBase + pixelOffset];
+    outG[index] = planeStack[stackBase + pixelCount + pixelOffset];
+    outB[index] = planeStack[stackBase + pixelCount * 2U + pixelOffset];
+}
+
 __global__ void applyShoulderKernel(float* r,
                                     float* g,
                                     float* b,
@@ -1067,6 +1642,22 @@ __global__ void applyShoulderKernel(float* r,
                                     float shoulder) {
     const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= count) {
+        return;
+    }
+    r[index] = softShoulderDevice(r[index], shoulder);
+    g[index] = softShoulderDevice(g[index], shoulder);
+    b[index] = softShoulderDevice(b[index], shoulder);
+}
+
+__global__ void applyShoulderStackKernel(float* r,
+                                         float* g,
+                                         float* b,
+                                         std::size_t pixelCount,
+                                         int stackDepth,
+                                         float shoulder) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t totalCount = pixelCount * static_cast<std::size_t>(max(0, stackDepth));
+    if (index >= totalCount) {
         return;
     }
     r[index] = softShoulderDevice(r[index], shoulder);
@@ -1095,17 +1686,95 @@ __global__ void combineRgbKernel(const float* aR,
     outB[index] = aB[index] * aGain + bB[index] * bGain;
 }
 
+__global__ void combineRgbStackKernel(const float* aR,
+                                      const float* aG,
+                                      const float* aB,
+                                      const float* bR,
+                                      const float* bG,
+                                      const float* bB,
+                                      std::size_t pixelCount,
+                                      int stackDepth,
+                                      float aGain,
+                                      float bGain,
+                                      float* outR,
+                                      float* outG,
+                                      float* outB) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t totalCount = pixelCount * static_cast<std::size_t>(max(0, stackDepth));
+    if (index >= totalCount) {
+        return;
+    }
+    outR[index] = aR[index] * aGain + bR[index] * bGain;
+    outG[index] = aG[index] * aGain + bG[index] * bGain;
+    outB[index] = aB[index] * aGain + bB[index] * bGain;
+}
+
+__device__ inline float fieldZoneWeightAtPixel(int localX,
+                                               int localY,
+                                               int tileOriginX,
+                                               int tileOriginY,
+                                               int frameX1,
+                                               int frameY1,
+                                               int frameWidth,
+                                               int frameHeight,
+                                               int zoneX,
+                                               int zoneY,
+                                               float gain) {
+    const float denomX = static_cast<float>(max(1, frameWidth - 1));
+    const float denomY = static_cast<float>(max(1, frameHeight - 1));
+    const float px = (static_cast<float>(tileOriginX + localX - frameX1) / denomX) * 2.0f;
+    const float py = (static_cast<float>(tileOriginY + localY - frameY1) / denomY) * 2.0f;
+    const float wx = fmaxf(0.0f, 1.0f - fabsf(px - static_cast<float>(zoneX)));
+    const float wy = fmaxf(0.0f, 1.0f - fabsf(py - static_cast<float>(zoneY)));
+    return wx * wy * gain;
+}
+
 __global__ void accumulateWeightedRgbKernel(const float* srcR,
                                             const float* srcG,
                                             const float* srcB,
                                             int width,
                                             int height,
+                                            int tileOriginX,
+                                            int tileOriginY,
+                                            int frameX1,
+                                            int frameY1,
+                                            int frameWidth,
+                                            int frameHeight,
                                             int zoneX,
                                             int zoneY,
                                             float gain,
                                             float* dstR,
                                             float* dstG,
                                             float* dstB) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const float weight = fieldZoneWeightAtPixel(
+        x, y, tileOriginX, tileOriginY, frameX1, frameY1, frameWidth, frameHeight, zoneX, zoneY, gain);
+    if (weight <= 0.0f) {
+        return;
+    }
+
+    const std::size_t index = static_cast<std::size_t>(y) * width + x;
+    dstR[index] += srcR[index] * weight;
+    dstG[index] += srcG[index] * weight;
+    dstB[index] += srcB[index] * weight;
+}
+
+__global__ void accumulateWeightedRgbLegacyKernel(const float* srcR,
+                                                  const float* srcG,
+                                                  const float* srcB,
+                                                  int width,
+                                                  int height,
+                                                  int zoneX,
+                                                  int zoneY,
+                                                  float gain,
+                                                  float* dstR,
+                                                  float* dstG,
+                                                  float* dstB) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) {
@@ -1127,6 +1796,158 @@ __global__ void accumulateWeightedRgbKernel(const float* srcR,
     dstR[index] += srcR[index] * weight;
     dstG[index] += srcG[index] * weight;
     dstB[index] += srcB[index] * weight;
+}
+
+__global__ void accumulateWeightedPlaneKernel(const float* srcPlane,
+                                              int width,
+                                              int height,
+                                              int tileOriginX,
+                                              int tileOriginY,
+                                              int frameX1,
+                                              int frameY1,
+                                              int frameWidth,
+                                              int frameHeight,
+                                              int zoneX,
+                                              int zoneY,
+                                              float gain,
+                                              float* dstPlane) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const float weight = fieldZoneWeightAtPixel(
+        x, y, tileOriginX, tileOriginY, frameX1, frameY1, frameWidth, frameHeight, zoneX, zoneY, gain);
+    if (weight <= 0.0f) {
+        return;
+    }
+
+    const std::size_t index = static_cast<std::size_t>(y) * width + x;
+    dstPlane[index] += srcPlane[index] * weight;
+}
+
+__global__ void accumulateWeightedPlaneTileKernel(const float* srcPlane,
+                                                  int srcWidth,
+                                                  int srcHeight,
+                                                  int srcOffsetX,
+                                                  int srcOffsetY,
+                                                  int tileWidth,
+                                                  int tileHeight,
+                                                  int dstTileX,
+                                                  int dstTileY,
+                                                  int dstWidth,
+                                                  int dstHeight,
+                                                  int frameX1,
+                                                  int frameY1,
+                                                  int frameWidth,
+                                                  int frameHeight,
+                                                  int zoneX,
+                                                  int zoneY,
+                                                  float gain,
+                                                  float* dstPlane) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= tileWidth || y >= tileHeight) {
+        return;
+    }
+
+    const int srcX = srcOffsetX + x;
+    const int srcY = srcOffsetY + y;
+    const int dstX = dstTileX + x;
+    const int dstY = dstTileY + y;
+    if (srcX < 0 || srcX >= srcWidth || srcY < 0 || srcY >= srcHeight ||
+        dstX < 0 || dstX >= dstWidth || dstY < 0 || dstY >= dstHeight) {
+        return;
+    }
+
+    const float weight = fieldZoneWeightAtPixel(
+        x, y, dstTileX, dstTileY, frameX1, frameY1, frameWidth, frameHeight, zoneX, zoneY, gain);
+    if (weight <= 0.0f) {
+        return;
+    }
+
+    const std::size_t srcIndex = static_cast<std::size_t>(srcY) * srcWidth + srcX;
+    const std::size_t dstIndex = static_cast<std::size_t>(dstY) * dstWidth + dstX;
+    dstPlane[dstIndex] += srcPlane[srcIndex] * weight;
+}
+
+__global__ void accumulateWeightedRgbStackKernel(const float* srcR,
+                                                 const float* srcG,
+                                                 const float* srcB,
+                                                 int width,
+                                                 int height,
+                                                 int tileOriginX,
+                                                 int tileOriginY,
+                                                 int frameX1,
+                                                 int frameY1,
+                                                 int frameWidth,
+                                                 int frameHeight,
+                                                 std::size_t pixelCount,
+                                                 int zoneCount,
+                                                 float* dstR,
+                                                 float* dstG,
+                                                 float* dstB) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= pixelCount) {
+        return;
+    }
+    const int x = static_cast<int>(index % static_cast<std::size_t>(width));
+    const int y = static_cast<int>(index / static_cast<std::size_t>(width));
+    float outRv = 0.0f;
+    float outGv = 0.0f;
+    float outBv = 0.0f;
+    for (int zoneIndex = 0; zoneIndex < zoneCount; ++zoneIndex) {
+        const int zoneX = zoneIndex % 3;
+        const int zoneY = zoneIndex / 3;
+        const float weight = fieldZoneWeightAtPixel(
+            x, y, tileOriginX, tileOriginY, frameX1, frameY1, frameWidth, frameHeight, zoneX, zoneY, 1.0f);
+        if (weight <= 0.0f) {
+            continue;
+        }
+        const std::size_t srcIndex = static_cast<std::size_t>(zoneIndex) * pixelCount + index;
+        outRv += srcR[srcIndex] * weight;
+        outGv += srcG[srcIndex] * weight;
+        outBv += srcB[srcIndex] * weight;
+    }
+    dstR[index] = outRv;
+    dstG[index] = outGv;
+    dstB[index] = outBv;
+}
+
+__global__ void accumulateWeightedPlanesStackKernel(const float* planeStack,
+                                                    std::size_t pixelCount,
+                                                    int width,
+                                                    int height,
+                                                    int tileOriginX,
+                                                    int tileOriginY,
+                                                    int frameX1,
+                                                    int frameY1,
+                                                    int frameWidth,
+                                                    int frameHeight,
+                                                    int zoneCount,
+                                                    int binCount,
+                                                    int binIndex,
+                                                    float* dstPlane) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= pixelCount) {
+        return;
+    }
+    const int x = static_cast<int>(index % static_cast<std::size_t>(width));
+    const int y = static_cast<int>(index / static_cast<std::size_t>(width));
+    float outValue = 0.0f;
+    for (int zoneIndex = 0; zoneIndex < zoneCount; ++zoneIndex) {
+        const int zoneX = zoneIndex % 3;
+        const int zoneY = zoneIndex / 3;
+        const float weight = fieldZoneWeightAtPixel(
+            x, y, tileOriginX, tileOriginY, frameX1, frameY1, frameWidth, frameHeight, zoneX, zoneY, 1.0f);
+        if (weight <= 0.0f) {
+            continue;
+        }
+        const std::size_t srcIndex = (static_cast<std::size_t>(zoneIndex) * binCount + static_cast<std::size_t>(binIndex)) * pixelCount + index;
+        outValue += planeStack[srcIndex] * weight;
+    }
+    dstPlane[index] = outValue;
 }
 
 __global__ void applyCreativeFringeKernel(const float* srcR,
@@ -1197,6 +2018,53 @@ __global__ void scaleRgbKernel(float* r,
     b[index] *= scale;
 }
 
+__global__ void scaleRgbByScalarKernel(float* r,
+                                       float* g,
+                                       float* b,
+                                       std::size_t count,
+                                       const float* scale) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= count) {
+        return;
+    }
+    const float value = scale != nullptr ? scale[0] : 1.0f;
+    r[index] *= value;
+    g[index] *= value;
+    b[index] *= value;
+}
+
+__global__ void computeScalarScaleKernel(const float* sum,
+                                         float epsilon,
+                                         float* outScale) {
+    if (blockIdx.x != 0 || threadIdx.x != 0 || outScale == nullptr) {
+        return;
+    }
+    const float value = (sum != nullptr) ? sum[0] : 0.0f;
+    outScale[0] = value > epsilon ? 1.0f / value : 1.0f;
+}
+
+__global__ void computePreserveScaleKernelCuda(const float* inputEnergy,
+                                               const float* effectEnergy,
+                                               float epsilon,
+                                               float* outScale) {
+    if (blockIdx.x != 0 || threadIdx.x != 0 || outScale == nullptr) {
+        return;
+    }
+    const float inputValue = (inputEnergy != nullptr) ? inputEnergy[0] : 0.0f;
+    const float effectValue = (effectEnergy != nullptr) ? effectEnergy[0] : 0.0f;
+    outScale[0] = effectValue > epsilon ? (inputValue / effectValue) : 1.0f;
+}
+
+__global__ void scaleBufferByScalarKernel(float* values,
+                                          std::size_t count,
+                                          const float* scale) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= count) {
+        return;
+    }
+    values[index] *= (scale != nullptr ? scale[0] : 1.0f);
+}
+
 __global__ void mapSpectralKernel(const float* bin0,
                                   const float* bin1,
                                   const float* bin2,
@@ -1230,6 +2098,70 @@ __global__ void mapSpectralKernel(const float* bin0,
         bin7[index],
         bin8[index],
     };
+
+    float naturalR = 0.0f;
+    float naturalG = 0.0f;
+    float naturalB = 0.0f;
+    float styleR = 0.0f;
+    float styleG = 0.0f;
+    float styleB = 0.0f;
+    mulSpectralMatrixDevice(config.naturalMatrix, config.binCount, spectralBins, &naturalR, &naturalG, &naturalB);
+    mulSpectralMatrixDevice(config.styleMatrix, config.binCount, spectralBins, &styleR, &styleG, &styleB);
+
+    float r = naturalR * (1.0f - force) + styleR * force;
+    float g = naturalG * (1.0f - force) + styleG * force;
+    float b = naturalB * (1.0f - force) + styleB * force;
+
+    r = fmaxf(0.0f, r);
+    g = fmaxf(0.0f, g);
+    b = fmaxf(0.0f, b);
+
+    const float gray = safeLumaDevice(r, g, b);
+    r = gray + (r - gray) * saturation;
+    g = gray + (g - gray) * saturation;
+    b = gray + (b - gray) * saturation;
+
+    if (chromaticAffectsLuma == 0) {
+        const float targetLuma = safeLumaDevice(naturalR, naturalG, naturalB);
+        const float currentLuma = safeLumaDevice(r, g, b);
+        if (currentLuma > 1e-6f) {
+            const float scale = targetLuma / currentLuma;
+            r *= scale;
+            g *= scale;
+            b *= scale;
+        }
+    }
+
+    outR[index] = r;
+    outG[index] = g;
+    outB[index] = b;
+}
+
+__global__ void mapSpectralStackKernel(const float* planeStack,
+                                       std::size_t pixelCount,
+                                       int zoneCount,
+                                       int binCount,
+                                       SpectralMapConfigGpu config,
+                                       float force,
+                                       float saturation,
+                                       int chromaticAffectsLuma,
+                                       float* outR,
+                                       float* outG,
+                                       float* outB) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t totalCount = pixelCount * static_cast<std::size_t>(max(0, zoneCount));
+    if (index >= totalCount) {
+        return;
+    }
+
+    const int zoneIndex = static_cast<int>(index / pixelCount);
+    const std::size_t pixelOffset = index % pixelCount;
+    float spectralBins[kLensDiffMaxSpectralBins] = {0.0f};
+    const int localBinCount = min(binCount, kLensDiffMaxSpectralBins);
+    for (int i = 0; i < localBinCount; ++i) {
+        const std::size_t srcIndex = (static_cast<std::size_t>(zoneIndex) * binCount + static_cast<std::size_t>(i)) * pixelCount + pixelOffset;
+        spectralBins[i] = planeStack[srcIndex];
+    }
 
     float naturalR = 0.0f;
     float naturalG = 0.0f;
@@ -1355,6 +2287,228 @@ bool createPlan(cufftHandle* plan,
     return true;
 }
 
+bool acquirePlan(PersistentCudaPlanRepository* repository,
+                 int width,
+                 int height,
+                 int batchCount,
+                 cudaStream_t stream,
+                 CudaRenderTimingBreakdown* timing,
+                 CudaPlanLease* outPlan,
+                 std::string* error) {
+    if (outPlan == nullptr || batchCount <= 0) {
+        if (error) *error = "cuda-invalid-plan-cache-request";
+        return false;
+    }
+    outPlan->release();
+    if (repository == nullptr) {
+        if (timing != nullptr) {
+            ++timing->planCacheMisses;
+        }
+        if (batchCount == 1) {
+            return createPlan(&outPlan->standaloneHandle, width, height, stream, error);
+        }
+        const int n[2] = {height, width};
+        if (!checkCufft(cufftPlanMany(&outPlan->standaloneHandle,
+                                      2,
+                                      const_cast<int*>(n),
+                                      nullptr,
+                                      1,
+                                      width * height,
+                                      nullptr,
+                                      1,
+                                      width * height,
+                                      CUFFT_C2C,
+                                      batchCount),
+                        "cufftPlanMany-standalone",
+                        error)) {
+            return false;
+        }
+        if (!checkCufft(cufftSetStream(outPlan->standaloneHandle, stream), "cufftSetStream-standalone-plan-many", error)) {
+            cufftDestroy(outPlan->standaloneHandle);
+            outPlan->standaloneHandle = 0;
+            return false;
+        }
+        return true;
+    }
+    const CudaPlanKey key {width, height, batchCount, static_cast<int>(batchCount > 1 ? CudaPlanLayoutKind::Batched2D
+                                                                                       : CudaPlanLayoutKind::Single2D)};
+    std::lock_guard<std::mutex> lock(repository->mutex);
+    auto& pool = repository->entries[key];
+    for (auto& entryPtr : pool) {
+        if (entryPtr != nullptr && !entryPtr->inUse) {
+            entryPtr->inUse = true;
+            entryPtr->stamp = ++repository->nextStamp;
+            if (timing != nullptr) {
+                ++timing->planCacheHits;
+                timing->maxPlanWorkBytes = std::max(timing->maxPlanWorkBytes, entryPtr->workBytes);
+            }
+            if (entryPtr->readyEvent != nullptr &&
+                !checkCuda(cudaStreamWaitEvent(stream, entryPtr->readyEvent, 0),
+                           "cudaStreamWaitEvent-plan-cache",
+                           error)) {
+                entryPtr->inUse = false;
+                return false;
+            }
+            if (!checkCufft(cufftSetStream(entryPtr->handle, stream), "cufftSetStream-cached", error) ||
+                !checkCufft(cufftSetWorkArea(entryPtr->handle, entryPtr->workspace.ptr), "cufftSetWorkArea-cached", error)) {
+                entryPtr->inUse = false;
+                return false;
+            }
+            outPlan->repository = repository;
+            outPlan->entry = entryPtr.get();
+            outPlan->releaseStream = stream;
+            return true;
+        }
+    }
+
+    if (timing != nullptr) {
+        ++timing->planCacheMisses;
+    }
+
+    const int n[2] = {height, width};
+    auto entry = std::make_unique<PersistentCudaPlanRepository::PlanEntry>();
+    std::size_t workBytes = 0;
+    if (!checkCufft(cufftCreate(&entry->handle), "cufftCreate", error) ||
+        !checkCufft(cufftSetAutoAllocation(entry->handle, 0), "cufftSetAutoAllocation", error) ||
+        !checkCufft(cufftMakePlanMany(entry->handle,
+                                      2,
+                                      const_cast<int*>(n),
+                                      nullptr,
+                                      1,
+                                      width * height,
+                                      nullptr,
+                                      1,
+                                      width * height,
+                                      CUFFT_C2C,
+                                      batchCount,
+                                      &workBytes),
+                    "cufftMakePlanMany",
+                    error)) {
+        return false;
+    }
+    if (!entry->workspace.allocate(std::max<std::size_t>(workBytes, 1U))) {
+        if (error) *error = "cuda-alloc-cufft-workspace";
+        return false;
+    }
+    if (!checkCuda(cudaEventCreateWithFlags(&entry->readyEvent, cudaEventDisableTiming),
+                   "cudaEventCreateWithFlags-plan-cache",
+                   error)) {
+        return false;
+    }
+    entry->workBytes = workBytes;
+    entry->inUse = true;
+    entry->stamp = ++repository->nextStamp;
+    if (!checkCufft(cufftSetWorkArea(entry->handle, entry->workspace.ptr), "cufftSetWorkArea", error) ||
+        !checkCufft(cufftSetStream(entry->handle, stream), "cufftSetStream-plan-many", error)) {
+        return false;
+    }
+    if (timing != nullptr) {
+        timing->maxPlanWorkBytes = std::max(timing->maxPlanWorkBytes, entry->workBytes);
+    }
+    auto* entryRaw = entry.get();
+    pool.push_back(std::move(entry));
+    outPlan->repository = repository;
+    outPlan->entry = entryRaw;
+    outPlan->releaseStream = stream;
+    return true;
+}
+
+bool LensDiffCudaLegacyPipelineEnabled() {
+    const char* value = std::getenv("LENSDIFF_CUDA_LEGACY_PIPELINE");
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    const std::string text(value);
+    return text != "0" && text != "false" && text != "FALSE" && text != "off" && text != "OFF";
+}
+
+bool LensDiffCudaPersistentPlanRepositoryEnabled() {
+    const char* value = std::getenv("LENSDIFF_CUDA_PERSISTENT_PLANS");
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    const std::string text(value);
+    return text != "0" && text != "false" && text != "FALSE" && text != "off" && text != "OFF";
+}
+
+FieldZoneBatchPlan buildFieldZoneBatchPlan(const LensDiffPsfBankCache& cache) {
+    FieldZoneBatchPlan plan {};
+    plan.fieldKey = cache.fieldKey;
+    plan.canonical3x3 = cache.fieldGridSize == 3 && cache.fieldZones.size() == 9U;
+    if (!plan.canonical3x3) {
+        return plan;
+    }
+    plan.zones.reserve(cache.fieldZones.size());
+    for (int zoneY = 0; zoneY < 3; ++zoneY) {
+        for (int zoneX = 0; zoneX < 3; ++zoneX) {
+            auto it = std::find_if(cache.fieldZones.begin(),
+                                   cache.fieldZones.end(),
+                                   [&](const LensDiffFieldZoneCache& zone) {
+                                       return zone.zoneX == zoneX && zone.zoneY == zoneY;
+                                   });
+            if (it == cache.fieldZones.end()) {
+                plan.zones.clear();
+                plan.canonical3x3 = false;
+                return plan;
+            }
+            plan.zones.push_back(&(*it));
+        }
+    }
+    return plan;
+}
+
+bool reduceFloatToScalarGpu(const DeviceBuffer<float>& buffer,
+                            std::size_t count,
+                            DeviceBuffer<float>* scratch,
+                            cudaStream_t stream,
+                            std::string* error) {
+    if (scratch == nullptr) {
+        if (error) *error = "cuda-null-reduce-scratch";
+        return false;
+    }
+    if (!scratch->allocate(1)) {
+        if (error) *error = "cuda-alloc-reduce-scratch";
+        return false;
+    }
+    if (!checkCuda(cudaMemsetAsync(scratch->ptr, 0, sizeof(float), stream), "cudaMemsetAsync-reduce-scalar", error)) {
+        return false;
+    }
+    const int block = 256;
+    const int grid = static_cast<int>((count + block - 1) / block);
+    reduceScalarSumKernel<<<grid, block, 0, stream>>>(buffer.ptr, count, scratch->ptr);
+    return checkCuda(cudaGetLastError(), "reduceScalarSumKernel", error);
+}
+
+bool normalizeDeviceBufferGpu(DeviceBuffer<float>& buffer,
+                              std::size_t count,
+                              DeviceBuffer<float>* sumScratch,
+                              DeviceBuffer<float>* scaleScratch,
+                              cudaStream_t stream,
+                              std::string* error) {
+    if (count == 0) {
+        return true;
+    }
+    if (sumScratch == nullptr || scaleScratch == nullptr) {
+        if (error) *error = "cuda-null-normalize-scratch";
+        return false;
+    }
+    if (!reduceFloatToScalarGpu(buffer, count, sumScratch, stream, error)) {
+        return false;
+    }
+    if (!scaleScratch->allocate(1)) {
+        if (error) *error = "cuda-alloc-normalize-scale";
+        return false;
+    }
+    computeScalarScaleKernel<<<1, 1, 0, stream>>>(sumScratch->ptr, 1e-6f, scaleScratch->ptr);
+    if (!checkCuda(cudaGetLastError(), "computeScalarScaleKernel", error)) {
+        return false;
+    }
+    const int block = 256;
+    const int grid = static_cast<int>((count + block - 1) / block);
+    scaleBufferByScalarKernel<<<grid, block, 0, stream>>>(buffer.ptr, count, scaleScratch->ptr);
+    return checkCuda(cudaGetLastError(), "scaleBufferByScalarKernel", error);
+}
+
 bool makeImageSpectrum(const float* src,
                        int width,
                        int height,
@@ -1378,6 +2532,45 @@ bool makeImageSpectrum(const float* src,
     }
 
     return checkCufft(cufftExecC2C(plan, out.ptr, out.ptr, CUFFT_FORWARD), "cufftExecC2C-forward-image", error);
+}
+
+bool makeImageSpectrumWindow(const float* src,
+                             int srcWidth,
+                             int srcHeight,
+                             int windowX,
+                             int windowY,
+                             int windowWidth,
+                             int windowHeight,
+                             int paddedWidth,
+                             int paddedHeight,
+                             cufftHandle plan,
+                             cudaStream_t stream,
+                             DeviceBuffer<cufftComplex>& out,
+                             std::string* error) {
+    const std::size_t count = static_cast<std::size_t>(paddedWidth) * paddedHeight;
+    if (!out.allocate(count)) {
+        if (error) *error = "cuda-alloc-image-spectrum-window";
+        return false;
+    }
+
+    dim3 block(16, 16);
+    dim3 grid((paddedWidth + block.x - 1) / block.x, (paddedHeight + block.y - 1) / block.y);
+    padRealWindowToComplexKernel<<<grid, block, 0, stream>>>(
+        src,
+        srcWidth,
+        srcHeight,
+        windowX,
+        windowY,
+        windowWidth,
+        windowHeight,
+        paddedWidth,
+        paddedHeight,
+        out.ptr);
+    if (!checkCuda(cudaGetLastError(), "padRealWindowToComplexKernel", error)) {
+        return false;
+    }
+
+    return checkCufft(cufftExecC2C(plan, out.ptr, out.ptr, CUFFT_FORWARD), "cufftExecC2C-forward-image-window", error);
 }
 
 bool makeKernelSpectrum(const LensDiffKernel& kernel,
@@ -1455,6 +2648,53 @@ bool convolveSpectrumToPlane(const DeviceBuffer<cufftComplex>& imageSpectrum,
     const float scale = 1.0f / static_cast<float>(paddedWidth * paddedHeight);
     extractRealKernel<<<grid, block, 0, stream>>>(tempSpectrum.ptr, width, height, paddedWidth, scale, outPlane.ptr);
     return checkCuda(cudaGetLastError(), "extractRealKernel", error);
+}
+
+bool convolveSpectrumStackToPlaneStack(const DeviceBuffer<cufftComplex>& imageSpectrumStack,
+                                       const DeviceBuffer<cufftComplex>& kernelSpectrumStack,
+                                       int width,
+                                       int height,
+                                       int paddedWidth,
+                                       int paddedHeight,
+                                       int batchCount,
+                                       cufftHandle plan,
+                                       cudaStream_t stream,
+                                       DeviceBuffer<cufftComplex>& tempSpectrum,
+                                       DeviceBuffer<float>& outPlaneStack,
+                                       std::string* error) {
+    const std::size_t paddedCount = static_cast<std::size_t>(paddedWidth) * paddedHeight;
+    const std::size_t planeCount = static_cast<std::size_t>(width) * height;
+    const std::size_t stackSpectrumCount = paddedCount * static_cast<std::size_t>(batchCount);
+    const std::size_t stackPlaneCount = planeCount * static_cast<std::size_t>(batchCount);
+    if (!tempSpectrum.allocate(stackSpectrumCount) || !outPlaneStack.allocate(stackPlaneCount)) {
+        if (error) *error = "cuda-alloc-convolution-stack-temp";
+        return false;
+    }
+
+    const int multiplyBlock = 256;
+    const int multiplyGrid = static_cast<int>((stackSpectrumCount + multiplyBlock - 1) / multiplyBlock);
+    multiplyComplexPairsStackKernel<<<multiplyGrid, multiplyBlock, 0, stream>>>(imageSpectrumStack.ptr,
+                                                                                kernelSpectrumStack.ptr,
+                                                                                tempSpectrum.ptr,
+                                                                                paddedCount,
+                                                                                batchCount);
+    if (!checkCuda(cudaGetLastError(), "multiplyComplexPairsStackKernel", error) ||
+        !checkCufft(cufftExecC2C(plan, tempSpectrum.ptr, tempSpectrum.ptr, CUFFT_INVERSE), "cufftExecC2C-inverse-stack", error)) {
+        return false;
+    }
+
+    const int block = 256;
+    const int grid = static_cast<int>((stackPlaneCount + block - 1) / block);
+    const float scale = 1.0f / static_cast<float>(paddedWidth * paddedHeight);
+    extractRealStackKernel<<<grid, block, 0, stream>>>(tempSpectrum.ptr,
+                                                       width,
+                                                       height,
+                                                       paddedWidth,
+                                                       paddedCount,
+                                                       batchCount,
+                                                       scale,
+                                                       outPlaneStack.ptr);
+    return checkCuda(cudaGetLastError(), "extractRealStackKernel", error);
 }
 
 bool downloadFloatBuffer(const DeviceBuffer<float>& buffer,
@@ -1606,20 +2846,24 @@ bool buildShiftedRawPsfOnCuda(const DeviceBuffer<float>& devicePupil,
                               int pupilSize,
                               int rawPsfSize,
                               cudaStream_t stream,
-                              std::vector<float>* shiftedRawPsf,
+                              DeviceBuffer<float>* deviceShiftedRawPsf,
+                              std::vector<float>* shiftedRawPsfDisplay,
                               std::string* error) {
-    if (shiftedRawPsf == nullptr) {
-        if (error) *error = "missing-shifted-raw-psf-output";
+    if (deviceShiftedRawPsf == nullptr) {
+        if (error) *error = "missing-shifted-raw-psf-device-output";
         return false;
     }
 
     const std::size_t rawCount = static_cast<std::size_t>(rawPsfSize) * rawPsfSize;
     DeviceBuffer<float> deviceShiftedIntensity;
     DeviceBuffer<cufftComplex> deviceSpectrum;
+    DeviceBuffer<float> normalizeSum;
+    DeviceBuffer<float> normalizeScale;
     cufftHandle plan = 0;
     const bool usePhase = devicePhase != nullptr && devicePhase->ptr != nullptr;
 
     if (!deviceShiftedIntensity.allocate(rawCount) ||
+        !deviceShiftedRawPsf->allocate(rawCount) ||
         !deviceSpectrum.allocate(rawCount)) {
         if (error) *error = "cuda-alloc-raw-psf-build";
         return false;
@@ -1663,36 +2907,35 @@ bool buildShiftedRawPsfOnCuda(const DeviceBuffer<float>& devicePupil,
         cufftDestroy(plan);
         return false;
     }
-
-    shiftedRawPsf->assign(rawCount, 0.0f);
-    if (!checkCuda(cudaMemcpyAsync(shiftedRawPsf->data(),
+    if (!normalizeDeviceBufferGpu(deviceShiftedIntensity, rawCount, &normalizeSum, &normalizeScale, stream, error)) {
+        cufftDestroy(plan);
+        return false;
+    }
+    if (!checkCuda(cudaMemcpyAsync(deviceShiftedRawPsf->ptr,
                                    deviceShiftedIntensity.ptr,
                                    rawCount * sizeof(float),
-                                   cudaMemcpyDeviceToHost,
+                                   cudaMemcpyDeviceToDevice,
                                    stream),
-                   "cudaMemcpyAsync-raw-psf-readback",
+                   "cudaMemcpyAsync-raw-psf-device-copy",
                    error)) {
         cufftDestroy(plan);
         return false;
     }
-
-    if (!checkCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize-raw-psf-readback", error)) {
-        cufftDestroy(plan);
-        return false;
-    }
-
-    cufftDestroy(plan);
-
-    float total = 0.0f;
-    for (float value : *shiftedRawPsf) {
-        total += value;
-    }
-    if (total > 0.0f) {
-        const float invTotal = 1.0f / total;
-        for (float& value : *shiftedRawPsf) {
-            value *= invTotal;
+    if (shiftedRawPsfDisplay != nullptr) {
+        shiftedRawPsfDisplay->assign(rawCount, 0.0f);
+        if (!checkCuda(cudaMemcpyAsync(shiftedRawPsfDisplay->data(),
+                                       deviceShiftedRawPsf->ptr,
+                                       rawCount * sizeof(float),
+                                       cudaMemcpyDeviceToHost,
+                                       stream),
+                       "cudaMemcpyAsync-raw-psf-readback",
+                       error) ||
+            !checkCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize-raw-psf-readback", error)) {
+            cufftDestroy(plan);
+            return false;
         }
     }
+    cufftDestroy(plan);
     return true;
 }
 
@@ -2203,15 +3446,20 @@ bool finalizePsfBankOnCuda(const LensDiffParams& params,
                            const std::vector<float>& pupil,
                            const std::vector<float>& phaseWaves,
                            int pupilSize,
+                           const DeviceBuffer<float>& rawPsf,
+                           int rawPsfSize,
                            const std::vector<float>& wavelengths,
-                           const std::vector<LensDiffKernel>& baseKernels,
+                           float scaleBase,
                            cudaStream_t stream,
                            LensDiffPsfBankCache* cache,
+                           CudaPsfBuildContext* buildContext,
                            std::string* error) {
     if (cache == nullptr) {
         if (error) *error = "cuda-null-psf-cache";
         return false;
     }
+    CudaPsfBuildContext localContext {};
+    CudaPsfBuildContext* psfContext = buildContext != nullptr ? buildContext : &localContext;
     *cache = {};
     cache->valid = true;
     cache->key = key;
@@ -2221,46 +3469,256 @@ bool finalizePsfBankOnCuda(const LensDiffParams& params,
     cache->phaseDisplay = phaseWaves;
     cache->phaseDisplaySize = pupilSize;
     cache->bins.clear();
-    cache->bins.reserve(std::min(wavelengths.size(), baseKernels.size()));
+    cache->bins.reserve(wavelengths.size());
 
-    for (std::size_t i = 0; i < wavelengths.size() && i < baseKernels.size(); ++i) {
-        const LensDiffKernel& baseKernel = baseKernels[i];
-        const std::size_t kernelCount = baseKernel.values.size();
-        DeviceBuffer<float> meanKernel;
-        DeviceBuffer<float> shapedKernel;
-        DeviceBuffer<float> structureKernel;
-        KernelStatsHost stats;
-        if (!buildAzimuthalMeanKernelOnCuda(baseKernel, stream, &meanKernel, &stats, error) ||
-            !buildShapedKernelOnCuda(baseKernel, meanKernel, static_cast<float>(params.anisotropyEmphasis), stream, &shapedKernel, error) ||
-            !buildStructureKernelOnCuda(shapedKernel, meanKernel, kernelCount, stream, &structureKernel, error)) {
+    const int maxKernelRadiusPx = std::max(4, ResolveLensDiffMaxKernelRadiusPx(params));
+    const int kernelSize = maxKernelRadiusPx * 2 + 1;
+    const int radiusMax = kernelSize / 2;
+    const std::size_t kernelCount = static_cast<std::size_t>(kernelSize) * kernelSize;
+    if (!psfContext->baseKernel.allocate(kernelCount) ||
+        !psfContext->meanKernel.allocate(kernelCount) ||
+        !psfContext->shapedKernel.allocate(kernelCount) ||
+        !psfContext->structureKernel.allocate(kernelCount) ||
+        !psfContext->ringSums.allocate(static_cast<std::size_t>(radiusMax + 1)) ||
+        !psfContext->ringCounts.allocate(static_cast<std::size_t>(radiusMax + 1)) ||
+        !psfContext->ringEnergy.allocate(static_cast<std::size_t>(radiusMax + 1)) ||
+        !psfContext->ringPeak.allocate(static_cast<std::size_t>(radiusMax + 1)) ||
+        !psfContext->totalEnergy.allocate(1) ||
+        !psfContext->globalPeak.allocate(1)) {
+        if (error) *error = "cuda-alloc-psf-build-context";
+        return false;
+    }
+
+    dim3 block2d(16, 16);
+    dim3 kernelGrid((kernelSize + block2d.x - 1) / block2d.x, (kernelSize + block2d.y - 1) / block2d.y);
+
+    for (std::size_t i = 0; i < wavelengths.size(); ++i) {
+        const auto wavelengthStart = std::chrono::steady_clock::now();
+        const float wavelength = wavelengths[i];
+        const float scaleFactor = scaleBase * (wavelength / 550.0f);
+        const float invScale = 1.0f / std::max(scaleFactor, 0.05f);
+        const auto finalizeStart = std::chrono::steady_clock::now();
+
+        if (!checkCuda(cudaMemsetAsync(psfContext->ringSums.ptr, 0, static_cast<std::size_t>(radiusMax + 1) * sizeof(float), stream),
+                       "cudaMemsetAsync-psf-ring-sums",
+                       error) ||
+            !checkCuda(cudaMemsetAsync(psfContext->ringCounts.ptr, 0, static_cast<std::size_t>(radiusMax + 1) * sizeof(int), stream),
+                       "cudaMemsetAsync-psf-ring-counts",
+                       error) ||
+            !checkCuda(cudaMemsetAsync(psfContext->ringEnergy.ptr, 0, static_cast<std::size_t>(radiusMax + 1) * sizeof(float), stream),
+                       "cudaMemsetAsync-psf-ring-energy",
+                       error) ||
+            !checkCuda(cudaMemsetAsync(psfContext->ringPeak.ptr, 0, static_cast<std::size_t>(radiusMax + 1) * sizeof(float), stream),
+                       "cudaMemsetAsync-psf-ring-peak",
+                       error) ||
+            !checkCuda(cudaMemsetAsync(psfContext->totalEnergy.ptr, 0, sizeof(float), stream), "cudaMemsetAsync-psf-total-energy", error) ||
+            !checkCuda(cudaMemsetAsync(psfContext->globalPeak.ptr, 0, sizeof(float), stream), "cudaMemsetAsync-psf-global-peak", error)) {
             return false;
         }
+
+        resampleRawPsfKernel<<<kernelGrid, block2d, 0, stream>>>(rawPsf.ptr, rawPsfSize, invScale, maxKernelRadiusPx, psfContext->baseKernel.ptr);
+        if (!checkCuda(cudaGetLastError(), "resampleRawPsfKernel-psf-finalize", error) ||
+            !normalizeDeviceBufferGpu(psfContext->baseKernel, kernelCount, &psfContext->reductionScalarA, &psfContext->scalarScale, stream, error)) {
+            return false;
+        }
+
+        const float center = static_cast<float>(kernelSize - 1) * 0.5f;
+        accumulateRadialProfileKernel<<<kernelGrid, block2d, 0, stream>>>(psfContext->baseKernel.ptr,
+                                                                           kernelSize,
+                                                                           radiusMax,
+                                                                           center,
+                                                                           psfContext->ringSums.ptr,
+                                                                           psfContext->ringCounts.ptr);
+        if (!checkCuda(cudaGetLastError(), "accumulateRadialProfileKernel-psf-finalize", error)) {
+            return false;
+        }
+        expandRadialMeanKernel<<<kernelGrid, block2d, 0, stream>>>(psfContext->ringSums.ptr,
+                                                                   psfContext->ringCounts.ptr,
+                                                                   kernelSize,
+                                                                   radiusMax,
+                                                                   center,
+                                                                   psfContext->meanKernel.ptr);
+        if (!checkCuda(cudaGetLastError(), "expandRadialMeanKernel-psf-finalize", error) ||
+            !normalizeDeviceBufferGpu(psfContext->meanKernel, kernelCount, &psfContext->reductionScalarA, &psfContext->scalarScale, stream, error)) {
+            return false;
+        }
+
+        const float gain = 1.0f + std::max(0.0f, static_cast<float>(params.anisotropyEmphasis)) * 4.0f;
+        const int flatBlock = 256;
+        const int flatGrid = static_cast<int>((kernelCount + flatBlock - 1) / flatBlock);
+        reshapeKernel<<<flatGrid, flatBlock, 0, stream>>>(psfContext->baseKernel.ptr,
+                                                          psfContext->meanKernel.ptr,
+                                                          kernelCount,
+                                                          gain,
+                                                          psfContext->shapedKernel.ptr);
+        if (!checkCuda(cudaGetLastError(), "reshapeKernel-psf-finalize", error) ||
+            !normalizeDeviceBufferGpu(psfContext->shapedKernel, kernelCount, &psfContext->reductionScalarA, &psfContext->scalarScale, stream, error)) {
+            return false;
+        }
+
+        positiveResidualKernelCuda<<<flatGrid, flatBlock, 0, stream>>>(psfContext->shapedKernel.ptr,
+                                                                       psfContext->meanKernel.ptr,
+                                                                       kernelCount,
+                                                                       psfContext->structureKernel.ptr);
+        if (!checkCuda(cudaGetLastError(), "positiveResidualKernelCuda-psf-finalize", error) ||
+            !normalizeDeviceBufferGpu(psfContext->structureKernel, kernelCount, &psfContext->reductionScalarA, &psfContext->scalarScale, stream, error)) {
+            return false;
+        }
+
+        accumulateSupportStatsKernel<<<kernelGrid, block2d, 0, stream>>>(psfContext->shapedKernel.ptr,
+                                                                          kernelSize,
+                                                                          radiusMax,
+                                                                          center,
+                                                                          psfContext->ringEnergy.ptr,
+                                                                          psfContext->ringPeak.ptr,
+                                                                          psfContext->totalEnergy.ptr,
+                                                                          psfContext->globalPeak.ptr);
+        if (!checkCuda(cudaGetLastError(), "accumulateSupportStatsKernel-psf-finalize", error)) {
+            return false;
+        }
+
+        KernelStatsHost stats;
+        stats.ringEnergy.assign(static_cast<std::size_t>(radiusMax + 1), 0.0f);
+        stats.ringPeak.assign(static_cast<std::size_t>(radiusMax + 1), 0.0f);
         float totalEnergy = 0.0f;
         float globalPeak = 0.0f;
-        const int maxKernelRadiusPx = std::max(4, ResolveLensDiffMaxKernelRadiusPx(params));
-        if (!computeAdaptiveSupportStatsOnCuda(shapedKernel,
-                                               baseKernel.size,
-                                               maxKernelRadiusPx,
-                                               stream,
-                                               &stats,
-                                               &totalEnergy,
-                                               &globalPeak,
-                                               error)) {
+        if (!checkCuda(cudaMemcpyAsync(stats.ringEnergy.data(),
+                                       psfContext->ringEnergy.ptr,
+                                       static_cast<std::size_t>(radiusMax + 1) * sizeof(float),
+                                       cudaMemcpyDeviceToHost,
+                                       stream),
+                       "cudaMemcpyAsync-psf-ring-energy-readback",
+                       error) ||
+            !checkCuda(cudaMemcpyAsync(stats.ringPeak.data(),
+                                       psfContext->ringPeak.ptr,
+                                       static_cast<std::size_t>(radiusMax + 1) * sizeof(float),
+                                       cudaMemcpyDeviceToHost,
+                                       stream),
+                       "cudaMemcpyAsync-psf-ring-peak-readback",
+                       error) ||
+            !checkCuda(cudaMemcpyAsync(&totalEnergy, psfContext->totalEnergy.ptr, sizeof(float), cudaMemcpyDeviceToHost, stream),
+                       "cudaMemcpyAsync-psf-total-energy-readback",
+                       error) ||
+            !checkCuda(cudaMemcpyAsync(&globalPeak, psfContext->globalPeak.ptr, sizeof(float), cudaMemcpyDeviceToHost, stream),
+                       "cudaMemcpyAsync-psf-global-peak-readback",
+                       error) ||
+            !checkCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize-psf-support-readback", error)) {
             return false;
         }
+        if (LensDiffTimingEnabled()) {
+            LogLensDiffTimingStage(
+                "cuda-psf-wavelength-finalize",
+                std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                    std::chrono::steady_clock::now() - finalizeStart)
+                    .count(),
+                "nm=" + std::to_string(static_cast<int>(std::lround(wavelength))));
+        }
+
+        const auto readbackStart = std::chrono::steady_clock::now();
         const int effectiveRadius = paddedAdaptiveSupportRadiusHost(
             estimateAdaptiveSupportRadiusFromStats(stats, maxKernelRadiusPx, totalEnergy, globalPeak),
             maxKernelRadiusPx);
+        if (LensDiffTimingEnabled()) {
+            LogLensDiffTimingStage(
+                "cuda-psf-support-radius-readback",
+                std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                    std::chrono::steady_clock::now() - readbackStart)
+                    .count(),
+                "nm=" + std::to_string(static_cast<int>(std::lround(wavelength))) +
+                    ",radius=" + std::to_string(effectiveRadius));
+        }
 
-        LensDiffPsfBin bin {};
-        bin.wavelengthNm = wavelengths[i];
-        if (!downloadCroppedKernel(meanKernel, baseKernel.size, effectiveRadius, stream, &bin.core, error) ||
-            !downloadCroppedKernel(shapedKernel, baseKernel.size, effectiveRadius, stream, &bin.full, error) ||
-            !downloadCroppedKernel(structureKernel, baseKernel.size, effectiveRadius, stream, &bin.structure, error)) {
+        const int croppedSize = effectiveRadius * 2 + 1;
+        const std::size_t croppedCount = static_cast<std::size_t>(croppedSize) * croppedSize;
+        if (!psfContext->cropCore.allocate(croppedCount) ||
+            !psfContext->cropFull.allocate(croppedCount) ||
+            !psfContext->cropStructure.allocate(croppedCount)) {
+            if (error) *error = "cuda-alloc-psf-crop";
             return false;
         }
+
+        const auto cropStart = std::chrono::steady_clock::now();
+        dim3 cropGrid((croppedSize + block2d.x - 1) / block2d.x, (croppedSize + block2d.y - 1) / block2d.y);
+        cropKernelToRadiusCuda<<<cropGrid, block2d, 0, stream>>>(psfContext->meanKernel.ptr,
+                                                                 kernelSize,
+                                                                 effectiveRadius,
+                                                                 croppedSize,
+                                                                 psfContext->cropCore.ptr);
+        cropKernelToRadiusCuda<<<cropGrid, block2d, 0, stream>>>(psfContext->shapedKernel.ptr,
+                                                                 kernelSize,
+                                                                 effectiveRadius,
+                                                                 croppedSize,
+                                                                 psfContext->cropFull.ptr);
+        cropKernelToRadiusCuda<<<cropGrid, block2d, 0, stream>>>(psfContext->structureKernel.ptr,
+                                                                 kernelSize,
+                                                                 effectiveRadius,
+                                                                 croppedSize,
+                                                                 psfContext->cropStructure.ptr);
+        if (!checkCuda(cudaGetLastError(), "cropKernelToRadiusCuda-psf-finalize", error)) {
+            return false;
+        }
+        applySupportBoundaryTaperCuda<<<cropGrid, block2d, 0, stream>>>(psfContext->cropCore.ptr, croppedSize, effectiveRadius);
+        applySupportBoundaryTaperCuda<<<cropGrid, block2d, 0, stream>>>(psfContext->cropFull.ptr, croppedSize, effectiveRadius);
+        applySupportBoundaryTaperCuda<<<cropGrid, block2d, 0, stream>>>(psfContext->cropStructure.ptr, croppedSize, effectiveRadius);
+        if (!checkCuda(cudaGetLastError(), "applySupportBoundaryTaperCuda-psf-finalize", error) ||
+            !normalizeDeviceBufferGpu(psfContext->cropCore, croppedCount, &psfContext->reductionScalarA, &psfContext->scalarScale, stream, error) ||
+            !normalizeDeviceBufferGpu(psfContext->cropFull, croppedCount, &psfContext->reductionScalarA, &psfContext->scalarScale, stream, error) ||
+            !normalizeDeviceBufferGpu(psfContext->cropStructure, croppedCount, &psfContext->reductionScalarA, &psfContext->scalarScale, stream, error)) {
+            return false;
+        }
+
+        LensDiffPsfBin bin {};
+        bin.wavelengthNm = wavelength;
+        bin.core.size = croppedSize;
+        bin.full.size = croppedSize;
+        bin.structure.size = croppedSize;
+        bin.core.values.assign(croppedCount, 0.0f);
+        bin.full.values.assign(croppedCount, 0.0f);
+        bin.structure.values.assign(croppedCount, 0.0f);
+        if (!checkCuda(cudaMemcpyAsync(bin.core.values.data(),
+                                       psfContext->cropCore.ptr,
+                                       croppedCount * sizeof(float),
+                                       cudaMemcpyDeviceToHost,
+                                       stream),
+                       "cudaMemcpyAsync-crop-core-readback",
+                       error) ||
+            !checkCuda(cudaMemcpyAsync(bin.full.values.data(),
+                                       psfContext->cropFull.ptr,
+                                       croppedCount * sizeof(float),
+                                       cudaMemcpyDeviceToHost,
+                                       stream),
+                       "cudaMemcpyAsync-crop-full-readback",
+                       error) ||
+            !checkCuda(cudaMemcpyAsync(bin.structure.values.data(),
+                                       psfContext->cropStructure.ptr,
+                                       croppedCount * sizeof(float),
+                                       cudaMemcpyDeviceToHost,
+                                       stream),
+                       "cudaMemcpyAsync-crop-structure-readback",
+                       error) ||
+            !checkCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize-psf-crop-readback", error)) {
+            return false;
+        }
+        if (LensDiffTimingEnabled()) {
+            LogLensDiffTimingStage(
+                "cuda-psf-crop-normalize",
+                std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                    std::chrono::steady_clock::now() - cropStart)
+                    .count(),
+                "nm=" + std::to_string(static_cast<int>(std::lround(wavelength))) +
+                    ",cropped=" + std::to_string(croppedSize));
+        }
+
         cache->supportRadiusPx = std::max(cache->supportRadiusPx, effectiveRadius);
         cache->bins.push_back(std::move(bin));
+        if (LensDiffTimingEnabled()) {
+            LogLensDiffTimingStage(
+                "cuda-psf-wavelength-total",
+                std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                    std::chrono::steady_clock::now() - wavelengthStart)
+                    .count(),
+                "nm=" + std::to_string(static_cast<int>(std::lround(wavelength))));
+        }
     }
     return true;
 }
@@ -2353,6 +3811,7 @@ bool createStaticDebugImage(const LensDiffParams& params,
 
 bool buildPsfBankGlobalOnlyCuda(const LensDiffParams& params,
                                 LensDiffPsfBankCache& cache,
+                                CudaPsfBuildContext* buildContext,
                                 cudaStream_t stream,
                                 std::string* error) {
     const LensDiffPsfBankKey key = MakeLensDiffPsfBankKey(params);
@@ -2372,8 +3831,16 @@ bool buildPsfBankGlobalOnlyCuda(const LensDiffParams& params,
         return false;
     }
 
-    std::vector<float> rawPsf;
-    if (!buildShiftedRawPsfOnCuda(devicePupil, hasPhase ? &devicePhase : nullptr, pupilSize, rawPsfSize, stream, &rawPsf, error)) {
+    CudaPsfBuildContext localBuildContext {};
+    CudaPsfBuildContext* psfContext = buildContext != nullptr ? buildContext : &localBuildContext;
+    if (!buildShiftedRawPsfOnCuda(devicePupil,
+                                  hasPhase ? &devicePhase : nullptr,
+                                  pupilSize,
+                                  rawPsfSize,
+                                  stream,
+                                  &psfContext->rawPsf,
+                                  nullptr,
+                                  error)) {
         return false;
     }
 
@@ -2408,28 +3875,245 @@ bool buildPsfBankGlobalOnlyCuda(const LensDiffParams& params,
     const float referenceFirstZeroRadius = std::max(1.0f, estimateFirstMinimumRadiusCuda(*referenceRawPsf, rawPsfSize));
     const float scaleBase = static_cast<float>(std::max(1.0, ResolveLensDiffDiffractionScalePx(params))) / referenceFirstZeroRadius;
     const std::vector<float> wavelengths = wavelengthsForModeCuda(params.spectralMode);
-    std::vector<LensDiffKernel> baseKernels;
-    if (!buildBaseKernelsFromRawPsfOnCuda(rawPsf,
-                                          rawPsfSize,
-                                          wavelengths,
-                                          scaleBase,
-                                          maxKernelRadiusPx,
-                                          stream,
-                                          &baseKernels,
-                                          error)) {
-        return false;
-    }
 
     return finalizePsfBankOnCuda(params,
                                  key,
                                  pupil,
                                  phaseWaves,
                                  pupilSize,
+                                 psfContext->rawPsf,
+                                 rawPsfSize,
                                  wavelengths,
-                                 baseKernels,
+                                 scaleBase,
                                  stream,
                                  &cache,
-                                 error);
+                                 psfContext,
+                                  error);
+}
+
+bool buildFieldZoneCachesBatchedCuda(const LensDiffParams& params,
+                                     LensDiffPsfBankCache* cache,
+                                     CudaPsfBuildContext* buildContext,
+                                     cudaStream_t stream,
+                                     std::string* error) {
+    if (cache == nullptr || buildContext == nullptr) {
+        if (error) *error = "cuda-null-field-zone-batch-cache";
+        return false;
+    }
+    const int pupilSize = GetLensDiffEffectivePupilResolution(params.pupilResolution);
+    const int maxKernelRadiusPx = std::max(4, ResolveLensDiffMaxKernelRadiusPx(params));
+    const int rawPsfSize = ChooseLensDiffRawPsfSize(pupilSize, maxKernelRadiusPx);
+    const std::size_t rawCount = static_cast<std::size_t>(rawPsfSize) * rawPsfSize;
+    constexpr int zoneCount = 9;
+
+    struct ZonePrep {
+        LensDiffFieldZoneCache zone;
+        std::vector<float> pupil;
+        std::vector<float> phase;
+    };
+    std::array<ZonePrep, zoneCount> zonePrep {};
+    DeviceBuffer<cufftComplex> batchedSpectrum;
+    DeviceBuffer<float> batchedShiftedIntensity;
+    if (!batchedSpectrum.allocate(rawCount * zoneCount) ||
+        !batchedShiftedIntensity.allocate(rawCount * zoneCount)) {
+        if (error) *error = "cuda-alloc-field-zone-batch";
+        return false;
+    }
+    if (!checkCuda(cudaMemsetAsync(batchedSpectrum.ptr,
+                                   0,
+                                   rawCount * zoneCount * sizeof(cufftComplex),
+                                   stream),
+                   "cudaMemsetAsync-field-zone-batch-spectrum",
+                   error)) {
+        return false;
+    }
+
+    const int offset = std::max(0, (rawPsfSize - pupilSize) / 2);
+    dim3 block2d(16, 16);
+    dim3 pupilGrid((pupilSize + block2d.x - 1) / block2d.x, (pupilSize + block2d.y - 1) / block2d.y);
+    for (int zoneY = 0; zoneY < 3; ++zoneY) {
+        for (int zoneX = 0; zoneX < 3; ++zoneX) {
+            const int zoneIndex = zoneY * 3 + zoneX;
+            const float normalizedX = static_cast<float>(zoneX - 1);
+            const float normalizedY = static_cast<float>(zoneY - 1);
+            ZonePrep& prep = zonePrep[static_cast<std::size_t>(zoneIndex)];
+            prep.zone.zoneX = zoneX;
+            prep.zone.zoneY = zoneY;
+            prep.zone.normalizedX = normalizedX;
+            prep.zone.normalizedY = normalizedY;
+            prep.zone.radialNorm = std::min(1.0f, std::sqrt(normalizedX * normalizedX + normalizedY * normalizedY) / std::sqrt(2.0f));
+            prep.zone.resolvedParams = ResolveLensDiffFieldZoneParams(params, normalizedX, normalizedY);
+
+            DeviceBuffer<float> devicePupil;
+            DeviceBuffer<float> devicePhase;
+            bool hasPhase = false;
+            if (!buildPupilAmplitudeOnCuda(prep.zone.resolvedParams, pupilSize, stream, &devicePupil, error) ||
+                !buildPhaseWavesOnCuda(prep.zone.resolvedParams, pupilSize, stream, &devicePhase, &hasPhase, error) ||
+                !downloadFloatBuffer(devicePupil,
+                                     static_cast<std::size_t>(pupilSize) * pupilSize,
+                                     stream,
+                                     &prep.pupil,
+                                     "cudaMemcpyAsync-download-field-zone-pupil",
+                                     error)) {
+                return false;
+            }
+            if (hasPhase) {
+                if (!downloadFloatBuffer(devicePhase,
+                                         static_cast<std::size_t>(pupilSize) * pupilSize,
+                                         stream,
+                                         &prep.phase,
+                                         "cudaMemcpyAsync-download-field-zone-phase",
+                                         error)) {
+                    return false;
+                }
+            } else {
+                prep.phase.assign(static_cast<std::size_t>(pupilSize) * pupilSize, 0.0f);
+            }
+
+            embedCenteredComplexPupilKernel<<<pupilGrid, block2d, 0, stream>>>(devicePupil.ptr,
+                                                                               hasPhase ? devicePhase.ptr : nullptr,
+                                                                               pupilSize,
+                                                                               rawPsfSize,
+                                                                               offset,
+                                                                               batchedSpectrum.ptr + rawCount * static_cast<std::size_t>(zoneIndex));
+            if (!checkCuda(cudaGetLastError(), "embedCenteredComplexPupilKernel-field-zone-batch", error)) {
+                return false;
+            }
+        }
+    }
+
+    cufftHandle batchPlan = 0;
+    const int n[2] = {rawPsfSize, rawPsfSize};
+    if (!checkCufft(cufftPlanMany(&batchPlan,
+                                  2,
+                                  const_cast<int*>(n),
+                                  nullptr,
+                                  1,
+                                  rawPsfSize * rawPsfSize,
+                                  nullptr,
+                                  1,
+                                  rawPsfSize * rawPsfSize,
+                                  CUFFT_C2C,
+                                  zoneCount),
+                    "cufftPlanMany-field-zone-raw-psf",
+                    error) ||
+        !checkCufft(cufftSetStream(batchPlan, stream), "cufftSetStream-field-zone-raw-psf", error)) {
+        if (batchPlan != 0) {
+            cufftDestroy(batchPlan);
+        }
+        return false;
+    }
+    const bool fftOk = checkCufft(cufftExecC2C(batchPlan, batchedSpectrum.ptr, batchedSpectrum.ptr, CUFFT_FORWARD),
+                                  "cufftExecC2C-field-zone-raw-psf",
+                                  error);
+    cufftDestroy(batchPlan);
+    if (!fftOk) {
+        return false;
+    }
+
+    dim3 rawGrid((rawPsfSize + block2d.x - 1) / block2d.x, (rawPsfSize + block2d.y - 1) / block2d.y);
+    for (int zoneIndex = 0; zoneIndex < zoneCount; ++zoneIndex) {
+        extractShiftedIntensityKernel<<<rawGrid, block2d, 0, stream>>>(
+            batchedSpectrum.ptr + rawCount * static_cast<std::size_t>(zoneIndex),
+            rawPsfSize,
+            batchedShiftedIntensity.ptr + rawCount * static_cast<std::size_t>(zoneIndex));
+        if (!checkCuda(cudaGetLastError(), "extractShiftedIntensityKernel-field-zone-batch", error)) {
+            return false;
+        }
+    }
+
+    const std::shared_ptr<const std::vector<float>> referenceRawPsf = GetLensDiffReferenceRawPsfCached(pupilSize, rawPsfSize);
+    const float referenceFirstZeroRadius = std::max(1.0f, estimateFirstMinimumRadiusCuda(*referenceRawPsf, rawPsfSize));
+    cache->fieldGridSize = 3;
+    cache->fieldKey = MakeLensDiffFieldKey(params);
+    cache->fieldZones.clear();
+    cache->fieldZones.reserve(zoneCount);
+    for (int zoneIndex = 0; zoneIndex < zoneCount; ++zoneIndex) {
+        ZonePrep& prep = zonePrep[static_cast<std::size_t>(zoneIndex)];
+        if (!buildContext->rawPsf.allocate(rawCount) ||
+            !checkCuda(cudaMemcpyAsync(buildContext->rawPsf.ptr,
+                                       batchedShiftedIntensity.ptr + rawCount * static_cast<std::size_t>(zoneIndex),
+                                       rawCount * sizeof(float),
+                                       cudaMemcpyDeviceToDevice,
+                                       stream),
+                       "cudaMemcpyAsync-field-zone-raw-psf-slice",
+                       error)) {
+            return false;
+        }
+        LensDiffPsfBankCache zoneCache {};
+        const float scaleBase = static_cast<float>(std::max(1.0, ResolveLensDiffDiffractionScalePx(prep.zone.resolvedParams))) / referenceFirstZeroRadius;
+        const std::vector<float> wavelengths = wavelengthsForModeCuda(prep.zone.resolvedParams.spectralMode);
+        const LensDiffPsfBankKey key = MakeLensDiffPsfBankKey(prep.zone.resolvedParams);
+        if (!finalizePsfBankOnCuda(prep.zone.resolvedParams,
+                                   key,
+                                   prep.pupil,
+                                   prep.phase,
+                                   pupilSize,
+                                   buildContext->rawPsf,
+                                   rawPsfSize,
+                                   wavelengths,
+                                   scaleBase,
+                                   stream,
+                                   &zoneCache,
+                                   buildContext,
+                                   error)) {
+            return false;
+        }
+        prep.zone.key = zoneCache.key;
+        prep.zone.bins = std::move(zoneCache.bins);
+        prep.zone.supportRadiusPx = zoneCache.supportRadiusPx;
+        prep.zone.pupilDisplaySize = zoneCache.pupilDisplaySize;
+        prep.zone.pupilDisplay = std::move(zoneCache.pupilDisplay);
+        prep.zone.phaseDisplaySize = zoneCache.phaseDisplaySize;
+        prep.zone.phaseDisplay = std::move(zoneCache.phaseDisplay);
+        cache->fieldZones.push_back(std::move(prep.zone));
+    }
+    return true;
+}
+
+bool buildFieldZoneCachesLegacyCuda(const LensDiffParams& params,
+                                    LensDiffPsfBankCache* cache,
+                                    cudaStream_t stream,
+                                    std::string* error) {
+    if (cache == nullptr) {
+        if (error) *error = "cuda-null-field-zone-legacy-cache";
+        return false;
+    }
+    const LensDiffFieldKey fieldKey = MakeLensDiffFieldKey(params);
+    cache->fieldGridSize = 3;
+    cache->fieldKey = fieldKey;
+    cache->fieldZones.clear();
+    cache->fieldZones.reserve(9);
+    for (int zoneY = 0; zoneY < 3; ++zoneY) {
+        for (int zoneX = 0; zoneX < 3; ++zoneX) {
+            const float normalizedX = static_cast<float>(zoneX - 1);
+            const float normalizedY = static_cast<float>(zoneY - 1);
+            LensDiffFieldZoneCache zone {};
+            zone.zoneX = zoneX;
+            zone.zoneY = zoneY;
+            zone.normalizedX = normalizedX;
+            zone.normalizedY = normalizedY;
+            zone.radialNorm = std::min(1.0f,
+                                       std::sqrt(normalizedX * normalizedX + normalizedY * normalizedY) /
+                                           std::sqrt(2.0f));
+            zone.resolvedParams = ResolveLensDiffFieldZoneParams(params, normalizedX, normalizedY);
+
+            LensDiffPsfBankCache zoneCache {};
+            CudaPsfBuildContext zoneBuildContext {};
+            if (!buildPsfBankGlobalOnlyCuda(zone.resolvedParams, zoneCache, &zoneBuildContext, stream, error)) {
+                return false;
+            }
+            zone.key = zoneCache.key;
+            zone.bins = std::move(zoneCache.bins);
+            zone.supportRadiusPx = zoneCache.supportRadiusPx;
+            zone.pupilDisplaySize = zoneCache.pupilDisplaySize;
+            zone.pupilDisplay = std::move(zoneCache.pupilDisplay);
+            zone.phaseDisplaySize = zoneCache.phaseDisplaySize;
+            zone.phaseDisplay = std::move(zoneCache.phaseDisplay);
+            cache->fieldZones.push_back(std::move(zone));
+        }
+    }
+    return true;
 }
 
 bool ensurePsfBankCuda(const LensDiffParams& params,
@@ -2448,7 +4132,8 @@ bool ensurePsfBankCuda(const LensDiffParams& params,
         return true;
     }
 
-    if (!buildPsfBankGlobalOnlyCuda(params, cache, stream, error)) {
+    CudaPsfBuildContext buildContext {};
+    if (!buildPsfBankGlobalOnlyCuda(params, cache, &buildContext, stream, error)) {
         return false;
     }
     if (!needFieldZones) {
@@ -2459,35 +4144,12 @@ bool ensurePsfBankCuda(const LensDiffParams& params,
     }
 
     LensDiffScopedTimer timer("cuda-field-zones");
-    cache.fieldGridSize = 3;
-    cache.fieldKey = fieldKey;
-    cache.fieldZones.clear();
-    cache.fieldZones.reserve(9);
-    for (int zoneY = 0; zoneY < 3; ++zoneY) {
-        for (int zoneX = 0; zoneX < 3; ++zoneX) {
-            const float normalizedX = static_cast<float>(zoneX - 1);
-            const float normalizedY = static_cast<float>(zoneY - 1);
-            LensDiffFieldZoneCache zone {};
-            zone.zoneX = zoneX;
-            zone.zoneY = zoneY;
-            zone.normalizedX = normalizedX;
-            zone.normalizedY = normalizedY;
-            zone.radialNorm = std::min(1.0f, std::sqrt(normalizedX * normalizedX + normalizedY * normalizedY) / std::sqrt(2.0f));
-            zone.resolvedParams = ResolveLensDiffFieldZoneParams(params, normalizedX, normalizedY);
-
-            LensDiffPsfBankCache zoneCache {};
-            if (!buildPsfBankGlobalOnlyCuda(zone.resolvedParams, zoneCache, stream, error)) {
-                return false;
-            }
-            zone.key = zoneCache.key;
-            zone.bins = std::move(zoneCache.bins);
-            zone.supportRadiusPx = zoneCache.supportRadiusPx;
-            zone.pupilDisplaySize = zoneCache.pupilDisplaySize;
-            zone.pupilDisplay = std::move(zoneCache.pupilDisplay);
-            zone.phaseDisplaySize = zoneCache.phaseDisplaySize;
-            zone.phaseDisplay = std::move(zoneCache.phaseDisplay);
-            cache.fieldZones.push_back(std::move(zone));
+    if (LensDiffCudaBatchedFieldCacheEnabled()) {
+        if (!buildFieldZoneCachesBatchedCuda(params, &cache, &buildContext, stream, error)) {
+            return false;
         }
+    } else if (!buildFieldZoneCachesLegacyCuda(params, &cache, stream, error)) {
+        return false;
     }
     return true;
 }
@@ -2512,7 +4174,81 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
     }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(request.cudaStream);
-    if (!ensurePsfBankCuda(params, cache, stream, error)) {
+    const bool legacyPipeline = LensDiffCudaLegacyPipelineEnabled();
+    const bool validateField = LensDiffCudaFieldValidateEnabled();
+    const bool useFrameWeightSpace = LensDiffCudaUseFrameWeightSpace();
+    const bool stackedFieldEnabled = LensDiffCudaExperimentalStackedFieldEnabled();
+    const bool nonFieldExecution = !HasLensDiffFieldPhase(params);
+    const bool persistentKernelCacheEnabled = nonFieldExecution || LensDiffCudaPersistentKernelCacheEnabled();
+    const bool persistentPlanRepositoryEnabled = nonFieldExecution || LensDiffCudaPersistentPlanRepositoryEnabled();
+    CudaRenderTimingBreakdown timing {};
+    PersistentCudaPlanRepository* planRepository = persistentPlanRepositoryEnabled ? &persistentCudaPlanRepository() : nullptr;
+    timing.validationEnabled = validateField;
+    timing.fieldWeightSpace = useFrameWeightSpace ? "frame" : "working";
+    auto timeCall = [&](double& accumulator, auto&& fn) {
+        const auto start = std::chrono::steady_clock::now();
+        auto result = fn();
+        accumulator += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+        return result;
+    };
+    auto logTimingBreakdown = [&]() {
+        if (!LensDiffTimingEnabled()) {
+            return;
+        }
+        LogLensDiffTimingStage(
+            "cuda-stage-psf-bank",
+            timing.psfBankMs,
+            "legacy=" + std::to_string(legacyPipeline ? 1 : 0));
+        LogLensDiffTimingStage(
+            "cuda-stage-source-fft",
+            timing.sourceFftMs,
+            "rgbHits=" + std::to_string(timing.rgbSourceCacheHits) +
+                ",rgbMisses=" + std::to_string(timing.rgbSourceCacheMisses) +
+                ",scalarHits=" + std::to_string(timing.scalarSourceCacheHits) +
+                ",scalarMisses=" + std::to_string(timing.scalarSourceCacheMisses));
+        LogLensDiffTimingStage(
+            "cuda-stage-kernel-fft",
+            timing.kernelFftMs,
+            "hits=" + std::to_string(timing.kernelCacheHits) +
+                ",misses=" + std::to_string(timing.kernelCacheMisses) +
+                ",planHits=" + std::to_string(timing.planCacheHits) +
+                ",planMisses=" + std::to_string(timing.planCacheMisses) +
+                ",maxWorkBytes=" + std::to_string(static_cast<unsigned long long>(timing.maxPlanWorkBytes)));
+        LogLensDiffTimingStage("cuda-stage-convolution", timing.convolutionMs);
+        LogLensDiffTimingStage(
+            "cuda-stage-field-zones",
+            timing.fieldZonesMs,
+            "legacy=" + std::to_string(legacyPipeline ? 1 : 0) +
+                ",batchDepth=" + std::to_string(timing.fieldZoneBatchDepth) +
+                ",hostSyncs=" + std::to_string(timing.hostSyncCount) +
+                ",branch=" + timing.fieldBranch +
+                ",weightSpace=" + timing.fieldWeightSpace +
+                ",fieldKeyHash=" + std::to_string(static_cast<unsigned long long>(timing.fieldKeyHash)) +
+                ",psfKeyHash=" + std::to_string(static_cast<unsigned long long>(timing.psfKeyHash)) +
+                ",scratchEstimate=" + std::to_string(static_cast<unsigned long long>(timing.fieldScratchEstimateBytes)) +
+                ",frameBounds=(" + std::to_string(request.frameBounds.x1) + "," + std::to_string(request.frameBounds.y1) +
+                    ")-(" + std::to_string(request.frameBounds.x2) + "," + std::to_string(request.frameBounds.y2) + ")");
+        LogLensDiffTimingStage("cuda-stage-scatter", timing.scatterMs);
+        LogLensDiffTimingStage("cuda-stage-creative-fringe", timing.creativeFringeMs);
+        LogLensDiffTimingStage("cuda-stage-native-resample", timing.nativeResampleMs);
+        LogLensDiffTimingStage("cuda-stage-composite", timing.compositeMs);
+        LogLensDiffTimingStage("cuda-stage-output-copy", timing.outputCopyMs);
+        if (timing.validationEnabled && timing.validationRan) {
+            LogLensDiffTimingStage(
+                "cuda-stage-field-validation",
+                timing.validationMs,
+                "referenceLegacy=" + std::to_string(timing.validationReferenceLegacy ? 1 : 0) +
+                    ",effectMaxAbs=" + std::to_string(timing.validationEffectMaxAbs) +
+                    ",coreMaxAbs=" + std::to_string(timing.validationCoreMaxAbs) +
+                    ",structureMaxAbs=" + std::to_string(timing.validationStructureMaxAbs) +
+                    (timing.validationNote.empty() ? std::string() : ("," + timing.validationNote)));
+        }
+    };
+    if (!timeCall(timing.psfBankMs, [&] {
+            return ensurePsfBankCuda(params, cache, stream, error);
+        })) {
         return false;
     }
     const LensDiffSpectrumConfig spectrumConfig = BuildLensDiffSpectrumConfig(params, cache.bins);
@@ -2527,6 +4263,18 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
     const std::size_t pixelCount = static_cast<std::size_t>(width) * height;
     const std::size_t srcRowFloats = static_cast<std::size_t>(request.src.rowBytes) / sizeof(float);
     const int inputTransfer = static_cast<int>(params.inputTransfer);
+    const LensDiffImageRect fieldFrameBounds =
+        useFrameWeightSpace
+            ? ((request.frameBounds.width() > 0 && request.frameBounds.height() > 0) ? request.frameBounds : request.src.bounds)
+            : LensDiffImageRect {0, 0, width, height};
+    const int fieldTileOriginX = useFrameWeightSpace ? request.src.bounds.x1 : 0;
+    const int fieldTileOriginY = useFrameWeightSpace ? request.src.bounds.y1 : 0;
+    const int fieldFrameX1 = fieldFrameBounds.x1;
+    const int fieldFrameY1 = fieldFrameBounds.y1;
+    const int fieldFrameWidth = std::max(1, fieldFrameBounds.width());
+    const int fieldFrameHeight = std::max(1, fieldFrameBounds.height());
+    timing.fieldKeyHash = diagnosticFieldKeyHash(cache.fieldKey);
+    timing.psfKeyHash = diagnosticPsfKeyHash(cache.key);
 
     const bool staticDebug = params.debugView == LensDiffDebugView::Pupil ||
                              params.debugView == LensDiffDebugView::Psf ||
@@ -2661,8 +4409,11 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
     const bool splitMode = params.lookMode == LensDiffLookMode::Split;
     const bool needCore = splitMode || params.debugView == LensDiffDebugView::Core;
     const bool needStructure = splitMode || params.debugView == LensDiffDebugView::Structure;
+    auto allocatePlaneSetCount = [&](PlaneSet& set, std::size_t count) -> bool {
+        return set.r.allocate(count) && set.g.allocate(count) && set.b.allocate(count);
+    };
     auto allocatePlaneSet = [&](PlaneSet& set) -> bool {
-        return set.r.allocate(pixelCount) && set.g.allocate(pixelCount) && set.b.allocate(pixelCount);
+        return allocatePlaneSetCount(set, pixelCount);
     };
     auto clearPlaneSet = [&](PlaneSet& set, const char* stage) -> bool {
         return checkCuda(cudaMemsetAsync(set.r.ptr, 0, pixelCount * sizeof(float), stream), stage, error) &&
@@ -2698,6 +4449,341 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                resamplePlaneToNative(srcSet.g, dstSet.g, stage) &&
                resamplePlaneToNative(srcSet.b, dstSet.b, stage);
     };
+    std::unordered_map<std::string, DeviceBuffer<cufftComplex>> rgbSourceSpectrumCache;
+    std::unordered_map<std::string, DeviceBuffer<cufftComplex>> scalarSourceSpectrumCache;
+    std::unordered_map<std::string, std::shared_ptr<DeviceBuffer<cufftComplex>>> kernelSpectrumCache;
+    std::unordered_map<std::string, FieldZoneSpectrumStacks> fieldKernelStackCache;
+    std::unordered_map<std::string, DeviceBuffer<cufftComplex>> fieldReplicatedSpectrumCache;
+    std::unordered_map<std::string, DeviceBuffer<cufftComplex>> complexScratchCache;
+    std::unordered_map<std::string, DeviceBuffer<float>> floatScratchCache;
+    std::unordered_map<std::string, PlaneSet> planeSetScratchCache;
+    std::unordered_map<std::string, SpectralPlaneSet> spectralPlaneScratchCache;
+    std::unordered_map<std::string, DeviceBuffer<cufftComplex>> fieldRgbTripletSpectrumCache;
+    const FieldZoneBatchPlan fieldPlan = buildFieldZoneBatchPlan(cache);
+    auto sourceSpectrumCacheKey = [&](const void* ptr, int paddedWidth, int paddedHeight, int channels) {
+        return std::to_string(reinterpret_cast<std::uintptr_t>(ptr)) + ":" +
+               std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) +
+               ":" + std::to_string(channels);
+    };
+    auto windowSourceSpectrumCacheKey = [&](const void* ptr,
+                                            int windowX,
+                                            int windowY,
+                                            int windowWidth,
+                                            int windowHeight,
+                                            int paddedWidth,
+                                            int paddedHeight,
+                                            int channels) {
+        return std::to_string(reinterpret_cast<std::uintptr_t>(ptr)) + ":" +
+               std::to_string(windowX) + "," + std::to_string(windowY) + "," +
+               std::to_string(windowWidth) + "x" + std::to_string(windowHeight) + ":" +
+               std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) + ":" +
+               std::to_string(channels);
+    };
+    auto kernelSpectrumCacheKey = [&](const LensDiffKernel& kernel, int paddedWidth, int paddedHeight) {
+        return std::to_string(reinterpret_cast<std::uintptr_t>(kernel.values.data())) + ":" +
+               std::to_string(kernel.size) + ":" +
+               std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight);
+    };
+    auto fieldStackCacheKey = [&](int paddedWidth,
+                                  int paddedHeight,
+                                  FieldEffectKind effectKind,
+                                  int binCount,
+                                  int repeatPerKernel,
+                                  int zoneStart,
+                                  int zoneCount) {
+        return std::to_string(static_cast<unsigned long long>(timing.fieldKeyHash)) + ":" +
+                std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) + ":" +
+                std::to_string(static_cast<int>(effectKind)) + ":" +
+                std::to_string(binCount) + ":" + std::to_string(repeatPerKernel) + ":" +
+                std::to_string(zoneStart) + ":" + std::to_string(zoneCount);
+    };
+    auto estimateStackWorkingBytes = [&](int paddedWidth, int paddedHeight, int sliceCount) -> std::uint64_t {
+        const std::uint64_t paddedCount = static_cast<std::uint64_t>(paddedWidth) * static_cast<std::uint64_t>(paddedHeight);
+        const std::uint64_t planeCount = static_cast<std::uint64_t>(pixelCount);
+        const std::uint64_t slices = static_cast<std::uint64_t>(std::max(0, sliceCount));
+        return slices * (paddedCount * static_cast<std::uint64_t>(sizeof(cufftComplex)) * 3ULL +
+                         planeCount * static_cast<std::uint64_t>(sizeof(float)));
+    };
+    constexpr std::uint64_t kFieldStackBudgetBytes = 1536ULL * 1024ULL * 1024ULL;
+    auto getPlanForDims = [&](int paddedWidth, int paddedHeight, int batchCount, CudaPlanLease* outPlan) -> bool {
+        return acquirePlan(planRepository, paddedWidth, paddedHeight, batchCount, stream, &timing, outPlan, error);
+    };
+    auto getComplexScratch = [&](const std::string& key,
+                                 std::size_t elementCount,
+                                 DeviceBuffer<cufftComplex>** outBuffer) -> bool {
+        if (outBuffer == nullptr) {
+            if (error) *error = "cuda-null-complex-scratch";
+            return false;
+        }
+        auto it = complexScratchCache.find(key);
+        if (it == complexScratchCache.end()) {
+            it = complexScratchCache.emplace(key, DeviceBuffer<cufftComplex> {}).first;
+        }
+        if (!it->second.allocate(elementCount)) {
+            if (error) *error = "cuda-alloc-complex-scratch";
+            return false;
+        }
+        *outBuffer = &it->second;
+        return true;
+    };
+    auto getFloatScratch = [&](const std::string& key,
+                               std::size_t elementCount,
+                               DeviceBuffer<float>** outBuffer) -> bool {
+        if (outBuffer == nullptr) {
+            if (error) *error = "cuda-null-float-scratch";
+            return false;
+        }
+        auto it = floatScratchCache.find(key);
+        if (it == floatScratchCache.end()) {
+            it = floatScratchCache.emplace(key, DeviceBuffer<float> {}).first;
+        }
+        if (!it->second.allocate(elementCount)) {
+            if (error) *error = "cuda-alloc-float-scratch";
+            return false;
+        }
+        *outBuffer = &it->second;
+        return true;
+    };
+    auto getPlaneSetScratch = [&](const std::string& key,
+                                  std::size_t elementCount,
+                                  PlaneSet** outSet) -> bool {
+        if (outSet == nullptr) {
+            if (error) *error = "cuda-null-plane-scratch";
+            return false;
+        }
+        auto it = planeSetScratchCache.find(key);
+        if (it == planeSetScratchCache.end()) {
+            it = planeSetScratchCache.emplace(key, PlaneSet {}).first;
+        }
+        if (!allocatePlaneSetCount(it->second, elementCount)) {
+            if (error) *error = "cuda-alloc-plane-scratch";
+            return false;
+        }
+        *outSet = &it->second;
+        return true;
+    };
+    auto getSpectralPlaneScratch = [&](const std::string& key,
+                                       SpectralPlaneSet** outSet) -> bool {
+        if (outSet == nullptr) {
+            if (error) *error = "cuda-null-spectral-scratch";
+            return false;
+        }
+        auto it = spectralPlaneScratchCache.find(key);
+        if (it == spectralPlaneScratchCache.end()) {
+            it = spectralPlaneScratchCache.emplace(key, SpectralPlaneSet {}).first;
+        }
+        for (auto& plane : it->second.bins) {
+            if (!plane.allocate(pixelCount)) {
+                if (error) *error = "cuda-alloc-spectral-scratch";
+                return false;
+            }
+        }
+        *outSet = &it->second;
+        return true;
+    };
+    auto getScalarSourceSpectrum = [&](const DeviceBuffer<float>& source,
+                                       int paddedWidth,
+                                       int paddedHeight,
+                                       DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
+        if (outSpectrum == nullptr) {
+            return false;
+        }
+        const std::string key = sourceSpectrumCacheKey(source.ptr, paddedWidth, paddedHeight, 1);
+        auto it = scalarSourceSpectrumCache.find(key);
+        if (it != scalarSourceSpectrumCache.end()) {
+            ++timing.scalarSourceCacheHits;
+            *outSpectrum = &it->second;
+            return true;
+        }
+        ++timing.scalarSourceCacheMisses;
+        CudaPlanLease plan;
+        DeviceBuffer<cufftComplex> spectrum;
+        if (!getPlanForDims(paddedWidth, paddedHeight, 1, &plan) ||
+            !timeCall(timing.sourceFftMs, [&] {
+                return makeImageSpectrum(source.ptr, width, height, paddedWidth, paddedHeight, plan.handle(), stream, spectrum, error);
+            })) {
+            return false;
+        }
+        auto insert = scalarSourceSpectrumCache.emplace(key, std::move(spectrum));
+        *outSpectrum = &insert.first->second;
+        return true;
+    };
+    auto getScalarSourceSpectrumWindow = [&](const DeviceBuffer<float>& source,
+                                             int windowX,
+                                             int windowY,
+                                             int windowWidth,
+                                             int windowHeight,
+                                             int paddedWidth,
+                                             int paddedHeight,
+                                             DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
+        if (outSpectrum == nullptr) {
+            return false;
+        }
+        const std::string key = windowSourceSpectrumCacheKey(source.ptr,
+                                                             windowX,
+                                                             windowY,
+                                                             windowWidth,
+                                                             windowHeight,
+                                                             paddedWidth,
+                                                             paddedHeight,
+                                                             1);
+        auto it = scalarSourceSpectrumCache.find(key);
+        if (it != scalarSourceSpectrumCache.end()) {
+            ++timing.scalarSourceCacheHits;
+            *outSpectrum = &it->second;
+            return true;
+        }
+        ++timing.scalarSourceCacheMisses;
+        CudaPlanLease plan;
+        DeviceBuffer<cufftComplex> spectrum;
+        if (!getPlanForDims(paddedWidth, paddedHeight, 1, &plan) ||
+            !timeCall(timing.sourceFftMs, [&] {
+                return makeImageSpectrumWindow(source.ptr,
+                                               width,
+                                               height,
+                                               windowX,
+                                               windowY,
+                                               windowWidth,
+                                               windowHeight,
+                                               paddedWidth,
+                                               paddedHeight,
+                                               plan.handle(),
+                                               stream,
+                                               spectrum,
+                                               error);
+            })) {
+            return false;
+        }
+        auto insert = scalarSourceSpectrumCache.emplace(key, std::move(spectrum));
+        *outSpectrum = &insert.first->second;
+        return true;
+    };
+    auto getKernelSpectrum = [&](const LensDiffKernel& kernel,
+                                 int paddedWidth,
+                                 int paddedHeight,
+                                 DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
+        if (outSpectrum == nullptr) {
+            return false;
+        }
+        const std::string key = kernelSpectrumCacheKey(kernel, paddedWidth, paddedHeight);
+        auto it = kernelSpectrumCache.find(key);
+        if (it != kernelSpectrumCache.end()) {
+            ++timing.kernelCacheHits;
+            *outSpectrum = it->second.get();
+            return true;
+        }
+        int currentDevice = 0;
+        if (!checkCuda(cudaGetDevice(&currentDevice), "cudaGetDevice-kernel-spectrum-cache", error)) {
+            return false;
+        }
+        const std::string persistentKey =
+            persistentKernelSpectrumCacheKey(currentDevice, kernel, paddedWidth, paddedHeight);
+        if (persistentKernelCacheEnabled) {
+            auto& persistentCache = persistentCudaKernelSpectrumCache();
+            std::lock_guard<std::mutex> lock(persistentCache.mutex);
+            auto persistentIt = persistentCache.entries.find(persistentKey);
+            if (persistentIt != persistentCache.entries.end() &&
+                persistentIt->second.spectrum != nullptr &&
+                persistentIt->second.spectrum->ptr != nullptr) {
+                if (persistentIt->second.readyEvent != nullptr &&
+                    !checkCuda(cudaStreamWaitEvent(stream, persistentIt->second.readyEvent, 0),
+                               "cudaStreamWaitEvent-kernel-spectrum-cache",
+                               error)) {
+                    return false;
+                }
+                ++timing.kernelCacheHits;
+                persistentIt->second.stamp = ++persistentCache.nextStamp;
+                auto insert = kernelSpectrumCache.emplace(key, persistentIt->second.spectrum);
+                *outSpectrum = insert.first->second.get();
+                return true;
+            }
+        }
+        ++timing.kernelCacheMisses;
+        CudaPlanLease plan;
+        DeviceBuffer<float> deviceKernel;
+        DeviceBuffer<cufftComplex> spectrum;
+        std::shared_ptr<DeviceBuffer<cufftComplex>> sharedSpectrum;
+        if (!getPlanForDims(paddedWidth, paddedHeight, 1, &plan) ||
+            !timeCall(timing.kernelFftMs, [&] {
+                return makeKernelSpectrum(kernel, paddedWidth, paddedHeight, plan.handle(), stream, deviceKernel, spectrum, error);
+            })) {
+            return false;
+        }
+        sharedSpectrum = std::make_shared<DeviceBuffer<cufftComplex>>();
+        *sharedSpectrum = std::move(spectrum);
+        if (persistentKernelCacheEnabled) {
+            cudaEvent_t readyEvent = nullptr;
+            if (!checkCuda(cudaEventCreateWithFlags(&readyEvent, cudaEventDisableTiming),
+                           "cudaEventCreateWithFlags-kernel-spectrum-cache",
+                           error) ||
+                !checkCuda(cudaEventRecord(readyEvent, stream),
+                           "cudaEventRecord-kernel-spectrum-cache",
+                           error)) {
+                if (readyEvent != nullptr) {
+                    cudaEventDestroy(readyEvent);
+                }
+                return false;
+            }
+            auto& persistentCache = persistentCudaKernelSpectrumCache();
+            std::lock_guard<std::mutex> lock(persistentCache.mutex);
+            constexpr std::size_t kMaxPersistentKernelSpectrumBytes = 2048U * 1024U * 1024U;
+            const std::size_t spectrumBytes = sharedSpectrum->count * sizeof(cufftComplex);
+            while (persistentCache.totalBytes + spectrumBytes > kMaxPersistentKernelSpectrumBytes &&
+                   !persistentCache.entries.empty()) {
+                auto oldestIt = persistentCache.entries.begin();
+                for (auto entryIt = std::next(persistentCache.entries.begin());
+                     entryIt != persistentCache.entries.end();
+                     ++entryIt) {
+                    if (entryIt->second.stamp < oldestIt->second.stamp) {
+                        oldestIt = entryIt;
+                    }
+                }
+                persistentCache.totalBytes -= oldestIt->second.bytes;
+                persistentCache.entries.erase(oldestIt);
+            }
+            if (spectrumBytes <= kMaxPersistentKernelSpectrumBytes) {
+                PersistentCudaKernelSpectrumCache::Entry entry {};
+                entry.spectrum = sharedSpectrum;
+                entry.bytes = spectrumBytes;
+                entry.stamp = ++persistentCache.nextStamp;
+                entry.readyEvent = readyEvent;
+                persistentCache.totalBytes += entry.bytes;
+                persistentCache.entries[persistentKey] = std::move(entry);
+            } else {
+                cudaEventDestroy(readyEvent);
+            }
+        }
+        auto insert = kernelSpectrumCache.emplace(key, std::move(sharedSpectrum));
+        *outSpectrum = insert.first->second.get();
+        return true;
+    };
+    auto getRgbPlaneSpectrum = [&](const DeviceBuffer<float>& source,
+                                   int paddedWidth,
+                                   int paddedHeight,
+                                   DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
+        if (outSpectrum == nullptr) {
+            return false;
+        }
+        const std::string key = sourceSpectrumCacheKey(source.ptr, paddedWidth, paddedHeight, 3);
+        auto it = rgbSourceSpectrumCache.find(key);
+        if (it != rgbSourceSpectrumCache.end()) {
+            ++timing.rgbSourceCacheHits;
+            *outSpectrum = &it->second;
+            return true;
+        }
+        ++timing.rgbSourceCacheMisses;
+        CudaPlanLease plan;
+        DeviceBuffer<cufftComplex> spectrum;
+        if (!getPlanForDims(paddedWidth, paddedHeight, 1, &plan) ||
+            !timeCall(timing.sourceFftMs, [&] {
+                return makeImageSpectrum(source.ptr, width, height, paddedWidth, paddedHeight, plan.handle(), stream, spectrum, error);
+            })) {
+            return false;
+        }
+        auto insert = rgbSourceSpectrumCache.emplace(key, std::move(spectrum));
+        *outSpectrum = &insert.first->second;
+        return true;
+    };
 
     auto convolvePlaneSet = [&](const DeviceBuffer<float>& srcRPlane,
                                 const DeviceBuffer<float>& srcGPlane,
@@ -2705,6 +4791,1178 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                                 const LensDiffKernel& kernel,
                                 PlaneSet& dst,
                                 const char* stagePrefix) -> bool {
+        const int paddedWidth = nextPowerOfTwo(width + kernel.size - 1);
+        const int paddedHeight = nextPowerOfTwo(height + kernel.size - 1);
+        CudaPlanLease plan;
+        DeviceBuffer<cufftComplex> tempSpectrum;
+        DeviceBuffer<cufftComplex>* imageSpecR = nullptr;
+        DeviceBuffer<cufftComplex>* imageSpecG = nullptr;
+        DeviceBuffer<cufftComplex>* imageSpecB = nullptr;
+        DeviceBuffer<cufftComplex>* kernelSpec = nullptr;
+        const bool ok = getPlanForDims(paddedWidth, paddedHeight, 1, &plan) &&
+                        getRgbPlaneSpectrum(srcRPlane, paddedWidth, paddedHeight, &imageSpecR) &&
+                        getRgbPlaneSpectrum(srcGPlane, paddedWidth, paddedHeight, &imageSpecG) &&
+                        getRgbPlaneSpectrum(srcBPlane, paddedWidth, paddedHeight, &imageSpecB) &&
+                        getKernelSpectrum(kernel, paddedWidth, paddedHeight, &kernelSpec) &&
+                        convolveSpectrumToPlane(*imageSpecR, *kernelSpec, width, height, paddedWidth, paddedHeight, plan.handle(), stream, tempSpectrum, dst.r, error) &&
+                        convolveSpectrumToPlane(*imageSpecG, *kernelSpec, width, height, paddedWidth, paddedHeight, plan.handle(), stream, tempSpectrum, dst.g, error) &&
+                        convolveSpectrumToPlane(*imageSpecB, *kernelSpec, width, height, paddedWidth, paddedHeight, plan.handle(), stream, tempSpectrum, dst.b, error);
+        if (!ok && error && error->empty()) {
+            *error = stagePrefix;
+        }
+        return ok;
+    };
+
+    auto renderFromBins = [&](const std::vector<LensDiffPsfBin>& bins,
+                              PlaneSet& outEffect,
+                              PlaneSet* outCore,
+                              PlaneSet* outStructure) -> bool {
+        if (!allocatePlaneSet(outEffect)) {
+            if (error) *error = "cuda-alloc-zone-effect";
+            return false;
+        }
+        const bool localNeedCore = splitMode || outCore != nullptr;
+        const bool localNeedStructure = splitMode || outStructure != nullptr;
+        PlaneSet localCorePlanes;
+        PlaneSet localStructurePlanes;
+        PlaneSet* corePlanes = outCore != nullptr ? outCore : &localCorePlanes;
+        PlaneSet* structurePlanes = outStructure != nullptr ? outStructure : &localStructurePlanes;
+        if ((localNeedCore && !allocatePlaneSet(*corePlanes)) ||
+            (localNeedStructure && !allocatePlaneSet(*structurePlanes))) {
+            if (error) *error = "cuda-alloc-zone-split";
+            return false;
+        }
+
+        if (params.spectralMode == LensDiffSpectralMode::Mono) {
+            PlaneSet fullEffect;
+            if (!splitMode && !allocatePlaneSet(fullEffect)) {
+                if (error) *error = "cuda-alloc-zone-full";
+                return false;
+            }
+
+            if (!splitMode && !convolvePlaneSet(redistributedR, redistributedG, redistributedB, bins.front().full, fullEffect, "cuda-convolve-zone-full")) {
+                return false;
+            }
+            if (localNeedCore && !convolvePlaneSet(redistributedR, redistributedG, redistributedB, bins.front().core, *corePlanes, "cuda-convolve-zone-core")) {
+                return false;
+            }
+            if (localNeedStructure && !convolvePlaneSet(redistributedR, redistributedG, redistributedB, bins.front().structure, *structurePlanes, "cuda-convolve-zone-structure")) {
+                return false;
+            }
+
+            if (splitMode) {
+                if (params.coreShoulder > 0.0) {
+                    applyShoulderKernel<<<flatGrid, flatBlock, 0, stream>>>(
+                        corePlanes->r.ptr, corePlanes->g.ptr, corePlanes->b.ptr, pixelCount, static_cast<float>(params.coreShoulder));
+                    if (!checkCuda(cudaGetLastError(), "applyShoulderKernel-zone-core", error)) {
+                        return false;
+                    }
+                }
+                if (params.structureShoulder > 0.0) {
+                    applyShoulderKernel<<<flatGrid, flatBlock, 0, stream>>>(
+                        structurePlanes->r.ptr, structurePlanes->g.ptr, structurePlanes->b.ptr, pixelCount, static_cast<float>(params.structureShoulder));
+                    if (!checkCuda(cudaGetLastError(), "applyShoulderKernel-zone-structure", error)) {
+                        return false;
+                    }
+                }
+                combineRgbKernel<<<flatGrid, flatBlock, 0, stream>>>(
+                    corePlanes->r.ptr, corePlanes->g.ptr, corePlanes->b.ptr,
+                    structurePlanes->r.ptr, structurePlanes->g.ptr, structurePlanes->b.ptr,
+                    pixelCount,
+                    static_cast<float>(std::max(0.0, params.coreGain)),
+                    static_cast<float>(std::max(0.0, params.structureGain)),
+                    outEffect.r.ptr, outEffect.g.ptr, outEffect.b.ptr);
+                return checkCuda(cudaGetLastError(), "combineRgbKernel-zone-mono", error);
+            }
+            return copyPlaneSet(fullEffect, outEffect, "cudaMemcpyAsync-zone-effect");
+        }
+
+        const LensDiffSpectrumConfig zoneSpectrumConfig = BuildLensDiffSpectrumConfig(params, bins);
+        const int paddedWidth = nextPowerOfTwo(width + bins.front().full.size - 1);
+        const int paddedHeight = nextPowerOfTwo(height + bins.front().full.size - 1);
+        CudaPlanLease plan;
+        DeviceBuffer<cufftComplex> tempSpectrum;
+        DeviceBuffer<cufftComplex>* driverSpectrum = nullptr;
+        SpectralPlaneSet fullBins;
+        SpectralPlaneSet coreBins;
+        SpectralPlaneSet structureBins;
+
+        auto allocateSpectral = [&](SpectralPlaneSet& set) -> bool {
+            for (auto& plane : set.bins) {
+                if (!plane.allocate(pixelCount)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        auto convolveBins = [&](const std::vector<LensDiffKernel>& kernels, SpectralPlaneSet& dst) -> bool {
+            const int activeBins = std::min<int>(static_cast<int>(kernels.size()), kLensDiffMaxSpectralBins);
+            for (int i = 0; i < activeBins; ++i) {
+                DeviceBuffer<cufftComplex>* kernelSpectrum = nullptr;
+                if (!getKernelSpectrum(kernels[static_cast<std::size_t>(i)],
+                                       paddedWidth,
+                                       paddedHeight,
+                                       &kernelSpectrum) ||
+                    !timeCall(timing.convolutionMs, [&] {
+                        return convolveSpectrumToPlane(*driverSpectrum,
+                                             *kernelSpectrum,
+                                             width,
+                                             height,
+                                             paddedWidth,
+                                             paddedHeight,
+                                              plan.handle(),
+                                             stream,
+                                             tempSpectrum,
+                                             dst.bins[static_cast<std::size_t>(i)],
+                                             error);
+                    })) {
+                    return false;
+                }
+            }
+            for (int i = activeBins; i < kLensDiffMaxSpectralBins; ++i) {
+                if (!checkCuda(cudaMemsetAsync(dst.bins[static_cast<std::size_t>(i)].ptr,
+                                               0,
+                                               pixelCount * sizeof(float),
+                                               stream),
+                               "cudaMemsetAsync-zone-spectral-zero",
+                               error)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        auto mapBins = [&](const SpectralPlaneSet& srcBins, PlaneSet& dst) -> bool {
+            SpectralMapConfigGpu mapConfig {};
+            mapConfig.binCount = zoneSpectrumConfig.binCount;
+            for (int i = 0; i < kLensDiffMaxSpectralBins * 3; ++i) {
+                mapConfig.naturalMatrix[static_cast<std::size_t>(i)] = zoneSpectrumConfig.naturalMatrix[static_cast<std::size_t>(i)];
+                mapConfig.styleMatrix[static_cast<std::size_t>(i)] = zoneSpectrumConfig.styleMatrix[static_cast<std::size_t>(i)];
+            }
+            mapSpectralKernel<<<flatGrid, flatBlock, 0, stream>>>(
+                srcBins.bins[0].ptr, srcBins.bins[1].ptr, srcBins.bins[2].ptr,
+                srcBins.bins[3].ptr, srcBins.bins[4].ptr, srcBins.bins[5].ptr,
+                srcBins.bins[6].ptr, srcBins.bins[7].ptr, srcBins.bins[8].ptr,
+                pixelCount,
+                mapConfig,
+                static_cast<float>(std::clamp(params.spectrumForce, 0.0, 1.0)),
+                static_cast<float>(std::max(0.0, params.spectrumSaturation)),
+                params.chromaticAffectsLuma ? 1 : 0,
+                dst.r.ptr, dst.g.ptr, dst.b.ptr);
+            return checkCuda(cudaGetLastError(), "mapSpectralKernel-zone", error);
+        };
+
+        if (!getPlanForDims(paddedWidth, paddedHeight, 1, &plan)) {
+            return false;
+        }
+        bool ok = getScalarSourceSpectrum(redistributedDriver, paddedWidth, paddedHeight, &driverSpectrum);
+        if (ok && !splitMode) {
+            ok = allocateSpectral(fullBins);
+        }
+        if (ok && localNeedCore) {
+            ok = allocateSpectral(coreBins);
+        }
+        if (ok && localNeedStructure) {
+            ok = allocateSpectral(structureBins);
+        }
+        if (!ok) {
+            if (error && error->empty()) *error = "cuda-alloc-zone-spectral";
+            return false;
+        }
+
+        if (ok && !splitMode) {
+            std::vector<LensDiffKernel> kernels;
+            kernels.reserve(bins.size());
+            for (const auto& bin : bins) kernels.push_back(bin.full);
+            ok = convolveBins(kernels, fullBins);
+        }
+        if (ok && localNeedCore) {
+            std::vector<LensDiffKernel> kernels;
+            kernels.reserve(bins.size());
+            for (const auto& bin : bins) kernels.push_back(bin.core);
+            ok = convolveBins(kernels, coreBins);
+        }
+        if (ok && localNeedStructure) {
+            std::vector<LensDiffKernel> kernels;
+            kernels.reserve(bins.size());
+            for (const auto& bin : bins) kernels.push_back(bin.structure);
+            ok = convolveBins(kernels, structureBins);
+        }
+        if (ok && !splitMode) {
+            ok = mapBins(fullBins, outEffect);
+        }
+        if (ok && localNeedCore) {
+            ok = mapBins(coreBins, *corePlanes);
+        }
+        if (ok && localNeedStructure) {
+            ok = mapBins(structureBins, *structurePlanes);
+        }
+        if (!ok) {
+            return false;
+        }
+
+        if (splitMode) {
+            if (params.coreShoulder > 0.0) {
+                applyShoulderKernel<<<flatGrid, flatBlock, 0, stream>>>(
+                    corePlanes->r.ptr, corePlanes->g.ptr, corePlanes->b.ptr, pixelCount, static_cast<float>(params.coreShoulder));
+                if (!checkCuda(cudaGetLastError(), "applyShoulderKernel-zone-core-spectral", error)) {
+                    return false;
+                }
+            }
+            if (params.structureShoulder > 0.0) {
+                applyShoulderKernel<<<flatGrid, flatBlock, 0, stream>>>(
+                    structurePlanes->r.ptr, structurePlanes->g.ptr, structurePlanes->b.ptr, pixelCount, static_cast<float>(params.structureShoulder));
+                if (!checkCuda(cudaGetLastError(), "applyShoulderKernel-zone-structure-spectral", error)) {
+                    return false;
+                }
+            }
+            combineRgbKernel<<<flatGrid, flatBlock, 0, stream>>>(
+                corePlanes->r.ptr, corePlanes->g.ptr, corePlanes->b.ptr,
+                structurePlanes->r.ptr, structurePlanes->g.ptr, structurePlanes->b.ptr,
+                pixelCount,
+                static_cast<float>(std::max(0.0, params.coreGain)),
+                static_cast<float>(std::max(0.0, params.structureGain)),
+                outEffect.r.ptr, outEffect.g.ptr, outEffect.b.ptr);
+            ok = checkCuda(cudaGetLastError(), "combineRgbKernel-zone-spectral", error);
+        }
+        return ok;
+    };
+    auto kernelForEffect = [&](const LensDiffPsfBin& bin, FieldEffectKind effectKind) -> const LensDiffKernel& {
+        switch (effectKind) {
+            case FieldEffectKind::Core: return bin.core;
+            case FieldEffectKind::Structure: return bin.structure;
+            case FieldEffectKind::Full:
+            default: return bin.full;
+        }
+    };
+    auto buildFieldKernelSpectrumStack = [&](FieldEffectKind effectKind,
+                                             int paddedWidth,
+                                             int paddedHeight,
+                                             int binCount,
+                                             int repeatPerKernel,
+                                             int zoneStart,
+                                             int zoneCount,
+                                             DeviceBuffer<cufftComplex>** outStack) -> bool {
+        if (outStack == nullptr || !fieldPlan.canonical3x3 || zoneStart < 0 || zoneCount <= 0 ||
+            zoneStart + zoneCount > static_cast<int>(fieldPlan.zones.size())) {
+            return false;
+        }
+        const std::string key = fieldStackCacheKey(
+            paddedWidth, paddedHeight, effectKind, binCount, repeatPerKernel, zoneStart, zoneCount);
+        auto it = fieldKernelStackCache.find(key);
+        if (it != fieldKernelStackCache.end()) {
+            *outStack = &it->second.spectrumStack;
+            return true;
+        }
+        FieldZoneSpectrumStacks stacks {};
+        stacks.paddedWidth = paddedWidth;
+        stacks.paddedHeight = paddedHeight;
+        stacks.zoneCount = zoneCount;
+        stacks.spectralBinCount = binCount;
+        stacks.effectKind = effectKind;
+        const std::size_t paddedCount = static_cast<std::size_t>(paddedWidth) * paddedHeight;
+        const int sliceCount = stacks.zoneCount * binCount * repeatPerKernel;
+        if (!stacks.spectrumStack.allocate(paddedCount * static_cast<std::size_t>(sliceCount))) {
+            if (error) *error = "cuda-alloc-field-kernel-spectrum-stack";
+            return false;
+        }
+        const auto buildStart = std::chrono::steady_clock::now();
+        for (int localZoneIndex = 0; localZoneIndex < stacks.zoneCount; ++localZoneIndex) {
+            const int zoneIndex = zoneStart + localZoneIndex;
+            const LensDiffFieldZoneCache* zone = fieldPlan.zones[static_cast<std::size_t>(zoneIndex)];
+            for (int binIndex = 0; binIndex < binCount; ++binIndex) {
+                DeviceBuffer<cufftComplex>* kernelSpectrum = nullptr;
+                if (zone == nullptr ||
+                    !getKernelSpectrum(kernelForEffect(zone->bins[static_cast<std::size_t>(binIndex)], effectKind),
+                                       paddedWidth,
+                                       paddedHeight,
+                                       &kernelSpectrum)) {
+                    return false;
+                }
+                for (int repeat = 0; repeat < repeatPerKernel; ++repeat) {
+                    const int dstSlice = (localZoneIndex * binCount + binIndex) * repeatPerKernel + repeat;
+                    if (!checkCuda(cudaMemcpyAsync(stacks.spectrumStack.ptr + paddedCount * static_cast<std::size_t>(dstSlice),
+                                                   kernelSpectrum->ptr,
+                                                   paddedCount * sizeof(cufftComplex),
+                                                   cudaMemcpyDeviceToDevice,
+                                                   stream),
+                                   "cudaMemcpyAsync-field-kernel-spectrum-stack",
+                                   error)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        if (LensDiffTimingEnabled()) {
+            LogLensDiffTimingStage(
+                "cuda-stage-zone-kernel-stack-build",
+                std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                    std::chrono::steady_clock::now() - buildStart)
+                    .count(),
+                "zones=" + std::to_string(stacks.zoneCount) +
+                    ",bins=" + std::to_string(binCount));
+        }
+        auto insert = fieldKernelStackCache.emplace(key, std::move(stacks));
+        *outStack = &insert.first->second.spectrumStack;
+        return true;
+    };
+    auto getReplicatedSpectrumStack = [&](const DeviceBuffer<cufftComplex>& srcSpectrum,
+                                          const std::string& key,
+                                          int srcSliceCount,
+                                          int dstSliceCount,
+                                          int paddedWidth,
+                                          int paddedHeight,
+                                          DeviceBuffer<cufftComplex>** outStack) -> bool {
+        if (outStack == nullptr) {
+            return false;
+        }
+        auto it = fieldReplicatedSpectrumCache.find(key);
+        if (it != fieldReplicatedSpectrumCache.end()) {
+            *outStack = &it->second;
+            return true;
+        }
+        const std::size_t paddedCount = static_cast<std::size_t>(paddedWidth) * paddedHeight;
+        DeviceBuffer<cufftComplex> stack;
+        if (!stack.allocate(paddedCount * static_cast<std::size_t>(dstSliceCount))) {
+            if (error) *error = "cuda-alloc-field-replicated-spectrum-stack";
+            return false;
+        }
+        const int block = 256;
+        const int grid = static_cast<int>(((paddedCount * static_cast<std::size_t>(dstSliceCount)) + block - 1) / block);
+        replicateComplexStackKernel<<<grid, block, 0, stream>>>(srcSpectrum.ptr,
+                                                                srcSliceCount,
+                                                                dstSliceCount,
+                                                                paddedCount,
+                                                                stack.ptr);
+        if (!checkCuda(cudaGetLastError(), "replicateComplexStackKernel", error)) {
+            return false;
+        }
+        auto insert = fieldReplicatedSpectrumCache.emplace(key, std::move(stack));
+        *outStack = &insert.first->second;
+        return true;
+    };
+    auto getRgbTripletSpectrumStack = [&](int paddedWidth,
+                                          int paddedHeight,
+                                          DeviceBuffer<cufftComplex>** outStack) -> bool {
+        if (outStack == nullptr) {
+            if (error) *error = "cuda-null-rgb-triplet-stack";
+            return false;
+        }
+        const std::string key = "field-rgb-triplet:" + std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight);
+        auto it = fieldRgbTripletSpectrumCache.find(key);
+        if (it != fieldRgbTripletSpectrumCache.end()) {
+            *outStack = &it->second;
+            return true;
+        }
+        DeviceBuffer<cufftComplex>* srcR = nullptr;
+        DeviceBuffer<cufftComplex>* srcG = nullptr;
+        DeviceBuffer<cufftComplex>* srcB = nullptr;
+        if (!getRgbPlaneSpectrum(redistributedR, paddedWidth, paddedHeight, &srcR) ||
+            !getRgbPlaneSpectrum(redistributedG, paddedWidth, paddedHeight, &srcG) ||
+            !getRgbPlaneSpectrum(redistributedB, paddedWidth, paddedHeight, &srcB)) {
+            return false;
+        }
+        const std::size_t paddedCount = static_cast<std::size_t>(paddedWidth) * paddedHeight;
+        DeviceBuffer<cufftComplex> stack;
+        if (!stack.allocate(paddedCount * 3U)) {
+            if (error) *error = "cuda-alloc-rgb-triplet-spectrum-stack";
+            return false;
+        }
+        if (!checkCuda(cudaMemcpyAsync(stack.ptr,
+                                       srcR->ptr,
+                                       paddedCount * sizeof(cufftComplex),
+                                       cudaMemcpyDeviceToDevice,
+                                       stream),
+                       "cudaMemcpyAsync-rgb-triplet-spectrum-r",
+                       error) ||
+            !checkCuda(cudaMemcpyAsync(stack.ptr + paddedCount,
+                                       srcG->ptr,
+                                       paddedCount * sizeof(cufftComplex),
+                                       cudaMemcpyDeviceToDevice,
+                                       stream),
+                       "cudaMemcpyAsync-rgb-triplet-spectrum-g",
+                       error) ||
+            !checkCuda(cudaMemcpyAsync(stack.ptr + paddedCount * 2U,
+                                       srcB->ptr,
+                                       paddedCount * sizeof(cufftComplex),
+                                       cudaMemcpyDeviceToDevice,
+                                       stream),
+                       "cudaMemcpyAsync-rgb-triplet-spectrum-b",
+                       error)) {
+            return false;
+        }
+    auto insert = fieldRgbTripletSpectrumCache.emplace(key, std::move(stack));
+        *outStack = &insert.first->second;
+        return true;
+    };
+    int tiledFieldTileWidth = 0;
+    int tiledFieldTileHeight = 0;
+    int tiledFieldChunkZones = 0;
+    std::uint64_t tiledFieldWorkingBytes = 0;
+    auto estimateTiledSpectralWorkingBytes = [&](int maxKernelSize,
+                                                 int tileWidth,
+                                                 int tileHeight,
+                                                 int chunkZoneCount,
+                                                 int binCount) -> std::uint64_t {
+        const int patchWidth = std::min(width, tileWidth + maxKernelSize - 1);
+        const int patchHeight = std::min(height, tileHeight + maxKernelSize - 1);
+        const int paddedWidth = nextPowerOfTwo(patchWidth + maxKernelSize - 1);
+        const int paddedHeight = nextPowerOfTwo(patchHeight + maxKernelSize - 1);
+        return estimateStackWorkingBytes(paddedWidth, paddedHeight, chunkZoneCount * binCount);
+    };
+    auto chooseTiledSpectralFieldLayout = [&](FieldEffectKind effectKind,
+                                              int* outMaxKernelSize,
+                                              int* outTileWidth,
+                                              int* outTileHeight,
+                                              int* outChunkZones,
+                                              std::uint64_t* outWorkingBytes) -> bool {
+        if (outMaxKernelSize == nullptr || outTileWidth == nullptr || outTileHeight == nullptr ||
+            outChunkZones == nullptr || outWorkingBytes == nullptr ||
+            !fieldPlan.canonical3x3 || params.spectralMode == LensDiffSpectralMode::Mono) {
+            return false;
+        }
+        const int zoneCount = static_cast<int>(fieldPlan.zones.size());
+        const int binCount = std::min<int>(static_cast<int>(fieldPlan.zones.front()->bins.size()), kLensDiffMaxSpectralBins);
+        int maxKernelSize = 1;
+        for (const LensDiffFieldZoneCache* zone : fieldPlan.zones) {
+            for (int binIndex = 0; binIndex < binCount; ++binIndex) {
+                maxKernelSize = std::max(maxKernelSize,
+                                         kernelForEffect(zone->bins[static_cast<std::size_t>(binIndex)], effectKind).size);
+            }
+        }
+        int tileWidth = std::min(width, 1024);
+        int tileHeight = std::min(height, 1024);
+        tileWidth = std::max(64, tileWidth);
+        tileHeight = std::max(64, tileHeight);
+        const std::uint64_t targetBudgetBytes = kFieldStackBudgetBytes * 3ULL / 4ULL;
+        while (true) {
+            const std::uint64_t oneZoneBytes = std::max<std::uint64_t>(
+                1ULL,
+                estimateTiledSpectralWorkingBytes(maxKernelSize, tileWidth, tileHeight, 1, binCount));
+            int chunkZones = static_cast<int>(targetBudgetBytes / oneZoneBytes);
+            chunkZones = std::max(1, std::min(zoneCount, chunkZones));
+            std::uint64_t workingBytes =
+                estimateTiledSpectralWorkingBytes(maxKernelSize, tileWidth, tileHeight, chunkZones, binCount);
+            while (workingBytes > targetBudgetBytes && chunkZones > 1) {
+                --chunkZones;
+                workingBytes =
+                    estimateTiledSpectralWorkingBytes(maxKernelSize, tileWidth, tileHeight, chunkZones, binCount);
+            }
+            if (workingBytes <= targetBudgetBytes || (tileWidth <= 64 && tileHeight <= 64 && chunkZones == 1)) {
+                *outMaxKernelSize = maxKernelSize;
+                *outTileWidth = tileWidth;
+                *outTileHeight = tileHeight;
+                *outChunkZones = chunkZones;
+                *outWorkingBytes = workingBytes;
+                return true;
+            }
+            if (tileWidth >= tileHeight && tileWidth > 64) {
+                tileWidth = std::max(64, (tileWidth + 1) / 2);
+            } else if (tileHeight > 64) {
+                tileHeight = std::max(64, (tileHeight + 1) / 2);
+            } else {
+                *outMaxKernelSize = maxKernelSize;
+                *outTileWidth = tileWidth;
+                *outTileHeight = tileHeight;
+                *outChunkZones = 1;
+                *outWorkingBytes = workingBytes;
+                return true;
+            }
+        }
+    };
+    auto renderFieldZonesSpectralTiled = [&](FieldEffectKind effectKind, PlaneSet* outPlaneSet) -> bool {
+        if (outPlaneSet == nullptr || !fieldPlan.canonical3x3 || params.spectralMode == LensDiffSpectralMode::Mono) {
+            return false;
+        }
+        const int zoneCount = static_cast<int>(fieldPlan.zones.size());
+        const int binCount = std::min<int>(static_cast<int>(fieldPlan.zones.front()->bins.size()), kLensDiffMaxSpectralBins);
+        int maxKernelSize = 1;
+        int tileWidth = std::min(width, 512);
+        int tileHeight = std::min(height, 512);
+        int chunkZoneCount = 1;
+        std::uint64_t workingBytes = 0;
+        if (!chooseTiledSpectralFieldLayout(effectKind,
+                                            &maxKernelSize,
+                                            &tileWidth,
+                                            &tileHeight,
+                                            &chunkZoneCount,
+                                            &workingBytes)) {
+            return false;
+        }
+        tiledFieldTileWidth = tileWidth;
+        tiledFieldTileHeight = tileHeight;
+        tiledFieldChunkZones = chunkZoneCount;
+        tiledFieldWorkingBytes = workingBytes;
+        timing.fieldZoneBatchDepth = std::max(timing.fieldZoneBatchDepth, chunkZoneCount);
+
+        SpectralPlaneSet* weightedPlanes = nullptr;
+        if (!getSpectralPlaneScratch("field-weighted-planes:" + std::to_string(binCount), &weightedPlanes)) {
+            return false;
+        }
+        for (int binIndex = 0; binIndex < kLensDiffMaxSpectralBins; ++binIndex) {
+            if (!checkCuda(cudaMemsetAsync(weightedPlanes->bins[static_cast<std::size_t>(binIndex)].ptr,
+                                           0,
+                                           pixelCount * sizeof(float),
+                                           stream),
+                           "cudaMemsetAsync-field-weighted-plane-reset",
+                           error)) {
+                return false;
+            }
+        }
+
+        const auto convolutionStart = std::chrono::steady_clock::now();
+        std::size_t tileCount = 0;
+        for (int tileY = 0; tileY < height; tileY += tileHeight) {
+            const int activeTileHeight = std::min(tileHeight, height - tileY);
+            for (int tileX = 0; tileX < width; tileX += tileWidth) {
+                const int activeTileWidth = std::min(tileWidth, width - tileX);
+                const int patchX = std::max(0, tileX - (maxKernelSize - 1) / 2);
+                const int patchY = std::max(0, tileY - (maxKernelSize - 1) / 2);
+                const int patchWidth = std::min(width, tileX + activeTileWidth + maxKernelSize / 2) - patchX;
+                const int patchHeight = std::min(height, tileY + activeTileHeight + maxKernelSize / 2) - patchY;
+                const int patchOffsetX = tileX - patchX;
+                const int patchOffsetY = tileY - patchY;
+                const int paddedWidth = nextPowerOfTwo(patchWidth + maxKernelSize - 1);
+                const int paddedHeight = nextPowerOfTwo(patchHeight + maxKernelSize - 1);
+                const std::size_t patchPixelCount = static_cast<std::size_t>(patchWidth) * patchHeight;
+                const std::size_t paddedCount = static_cast<std::size_t>(paddedWidth) * paddedHeight;
+                DeviceBuffer<cufftComplex>* driverSpectrum = nullptr;
+                if (!getScalarSourceSpectrumWindow(redistributedDriver,
+                                                  patchX,
+                                                  patchY,
+                                                  patchWidth,
+                                                  patchHeight,
+                                                  paddedWidth,
+                                                  paddedHeight,
+                                                  &driverSpectrum)) {
+                    return false;
+                }
+                for (int zoneBase = 0; zoneBase < zoneCount; zoneBase += chunkZoneCount) {
+                    const int activeZoneCount = std::min(chunkZoneCount, zoneCount - zoneBase);
+                    DeviceBuffer<cufftComplex>* sourceStack = nullptr;
+                    DeviceBuffer<cufftComplex>* kernelStack = nullptr;
+                    if (!getReplicatedSpectrumStack(*driverSpectrum,
+                                                    "field-driver-tile:" + std::to_string(patchX) + "," + std::to_string(patchY) +
+                                                        ":" + std::to_string(patchWidth) + "x" + std::to_string(patchHeight) + ":" +
+                                                        std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) + ":" +
+                                                        std::to_string(activeZoneCount * binCount),
+                                                    1,
+                                                    activeZoneCount * binCount,
+                                                    paddedWidth,
+                                                    paddedHeight,
+                                                    &sourceStack) ||
+                        !buildFieldKernelSpectrumStack(effectKind,
+                                                       paddedWidth,
+                                                       paddedHeight,
+                                                       binCount,
+                                                       1,
+                                                       zoneBase,
+                                                       activeZoneCount,
+                                                       &kernelStack)) {
+                        return false;
+                    }
+                    CudaPlanLease plan;
+                    if (!getPlanForDims(paddedWidth, paddedHeight, activeZoneCount * binCount, &plan)) {
+                        return false;
+                    }
+                    DeviceBuffer<cufftComplex>* tempSpectrum = nullptr;
+                    DeviceBuffer<float>* planeStack = nullptr;
+                    if (!getComplexScratch("field-tile-temp-spectrum:" + std::to_string(paddedWidth) + "x" +
+                                               std::to_string(paddedHeight) + ":" + std::to_string(activeZoneCount * binCount),
+                                           paddedCount * static_cast<std::size_t>(activeZoneCount * binCount),
+                                           &tempSpectrum) ||
+                        !getFloatScratch("field-tile-plane-stack:" + std::to_string(patchWidth) + "x" +
+                                             std::to_string(patchHeight) + ":" + std::to_string(activeZoneCount) + ":" +
+                                             std::to_string(binCount),
+                                         patchPixelCount * static_cast<std::size_t>(activeZoneCount * binCount),
+                                         &planeStack)) {
+                        return false;
+                    }
+                    if (!timeCall(timing.convolutionMs, [&] {
+                            return convolveSpectrumStackToPlaneStack(*sourceStack,
+                                                                     *kernelStack,
+                                                                     patchWidth,
+                                                                     patchHeight,
+                                                                     paddedWidth,
+                                                                     paddedHeight,
+                                                                     activeZoneCount * binCount,
+                                                                     plan.handle(),
+                                                                     stream,
+                                                                     *tempSpectrum,
+                                                                     *planeStack,
+                                                                     error);
+                        })) {
+                        return false;
+                    }
+                    dim3 tileGrid((activeTileWidth + block2d.x - 1) / block2d.x,
+                                  (activeTileHeight + block2d.y - 1) / block2d.y);
+                    for (int localZoneIndex = 0; localZoneIndex < activeZoneCount; ++localZoneIndex) {
+                        const LensDiffFieldZoneCache* zone =
+                            fieldPlan.zones[static_cast<std::size_t>(zoneBase + localZoneIndex)];
+                        if (zone == nullptr) {
+                            continue;
+                        }
+                        for (int binIndex = 0; binIndex < binCount; ++binIndex) {
+                            float* srcPlane = planeStack->ptr +
+                                patchPixelCount * (static_cast<std::size_t>(localZoneIndex) * static_cast<std::size_t>(binCount) +
+                                                   static_cast<std::size_t>(binIndex));
+                            accumulateWeightedPlaneTileKernel<<<tileGrid, block2d, 0, stream>>>(
+                                srcPlane,
+                                patchWidth,
+                                patchHeight,
+                                patchOffsetX,
+                                patchOffsetY,
+                                activeTileWidth,
+                                activeTileHeight,
+                                tileX,
+                                tileY,
+                                width,
+                                height,
+                                fieldFrameX1,
+                                fieldFrameY1,
+                                fieldFrameWidth,
+                                fieldFrameHeight,
+                                zone->zoneX,
+                                zone->zoneY,
+                                1.0f,
+                                weightedPlanes->bins[static_cast<std::size_t>(binIndex)].ptr);
+                            if (!checkCuda(cudaGetLastError(), "accumulateWeightedPlaneTileKernel", error)) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                ++tileCount;
+            }
+        }
+        if (LensDiffTimingEnabled()) {
+            LogLensDiffTimingStage(
+                "cuda-stage-zone-convolution-stack",
+                std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                    std::chrono::steady_clock::now() - convolutionStart)
+                    .count(),
+                "zones=" + std::to_string(zoneCount) +
+                    ",bins=" + std::to_string(binCount) +
+                    ",mode=tiled" +
+                    ",chunkZones=" + std::to_string(chunkZoneCount) +
+                    ",tile=" + std::to_string(tileWidth) + "x" + std::to_string(tileHeight) +
+                    ",tiles=" + std::to_string(tileCount));
+        }
+
+        if (!allocatePlaneSet(*outPlaneSet)) {
+            if (error) *error = "cuda-alloc-field-tiled-effect";
+            return false;
+        }
+        SpectralMapConfigGpu mapConfig {};
+        mapConfig.binCount = spectrumConfig.binCount;
+        for (int matrixIndex = 0; matrixIndex < kLensDiffMaxSpectralBins * 3; ++matrixIndex) {
+            mapConfig.naturalMatrix[static_cast<std::size_t>(matrixIndex)] = spectrumConfig.naturalMatrix[static_cast<std::size_t>(matrixIndex)];
+            mapConfig.styleMatrix[static_cast<std::size_t>(matrixIndex)] = spectrumConfig.styleMatrix[static_cast<std::size_t>(matrixIndex)];
+        }
+        mapSpectralKernel<<<flatGrid, flatBlock, 0, stream>>>(
+            weightedPlanes->bins[0].ptr, weightedPlanes->bins[1].ptr, weightedPlanes->bins[2].ptr,
+            weightedPlanes->bins[3].ptr, weightedPlanes->bins[4].ptr, weightedPlanes->bins[5].ptr,
+            weightedPlanes->bins[6].ptr, weightedPlanes->bins[7].ptr, weightedPlanes->bins[8].ptr,
+            pixelCount,
+            mapConfig,
+            static_cast<float>(std::clamp(params.spectrumForce, 0.0, 1.0)),
+            static_cast<float>(std::max(0.0, params.spectrumSaturation)),
+            params.chromaticAffectsLuma ? 1 : 0,
+            outPlaneSet->r.ptr, outPlaneSet->g.ptr, outPlaneSet->b.ptr);
+        return checkCuda(cudaGetLastError(), "mapSpectralKernel-field-tiled", error);
+    };
+    auto renderFieldZonesStackedSpectral = [&](FieldEffectKind effectKind, PlaneSet* outPlaneSet) -> bool {
+        if (outPlaneSet == nullptr || !fieldPlan.canonical3x3 || params.spectralMode == LensDiffSpectralMode::Mono) {
+            return false;
+        }
+        const int zoneCount = static_cast<int>(fieldPlan.zones.size());
+        const int binCount = std::min<int>(static_cast<int>(fieldPlan.zones.front()->bins.size()), kLensDiffMaxSpectralBins);
+        int maxKernelSize = 1;
+        for (const LensDiffFieldZoneCache* zone : fieldPlan.zones) {
+            for (int binIndex = 0; binIndex < binCount; ++binIndex) {
+                maxKernelSize = std::max(maxKernelSize,
+                                         kernelForEffect(zone->bins[static_cast<std::size_t>(binIndex)], effectKind).size);
+            }
+        }
+        const int paddedWidth = nextPowerOfTwo(width + maxKernelSize - 1);
+        const int paddedHeight = nextPowerOfTwo(height + maxKernelSize - 1);
+        DeviceBuffer<cufftComplex>* driverSpectrum = nullptr;
+        DeviceBuffer<cufftComplex>* sourceStack = nullptr;
+        DeviceBuffer<cufftComplex>* kernelStack = nullptr;
+        if (!getScalarSourceSpectrum(redistributedDriver, paddedWidth, paddedHeight, &driverSpectrum) ||
+            !getReplicatedSpectrumStack(*driverSpectrum,
+                                        "field-driver:" + std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) +
+                                            ":" + std::to_string(zoneCount * binCount),
+                                        1,
+                                        zoneCount * binCount,
+                                        paddedWidth,
+                                        paddedHeight,
+                                        &sourceStack) ||
+            !buildFieldKernelSpectrumStack(effectKind, paddedWidth, paddedHeight, binCount, 1, 0, zoneCount, &kernelStack)) {
+            return false;
+        }
+
+        CudaPlanLease plan;
+        if (!getPlanForDims(paddedWidth, paddedHeight, zoneCount * binCount, &plan)) {
+            return false;
+        }
+        DeviceBuffer<cufftComplex>* tempSpectrum = nullptr;
+        DeviceBuffer<float>* planeStack = nullptr;
+        const std::size_t paddedCount = static_cast<std::size_t>(paddedWidth) * paddedHeight;
+        if (!getComplexScratch("field-temp-spectrum:" + std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) +
+                                   ":" + std::to_string(zoneCount * binCount),
+                               paddedCount * static_cast<std::size_t>(zoneCount * binCount),
+                               &tempSpectrum) ||
+            !getFloatScratch("field-plane-stack:" + std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) +
+                                 ":" + std::to_string(zoneCount) + ":" + std::to_string(binCount),
+                             pixelCount * static_cast<std::size_t>(zoneCount * binCount),
+                             &planeStack)) {
+            return false;
+        }
+        const auto convolutionStart = std::chrono::steady_clock::now();
+        if (!timeCall(timing.convolutionMs, [&] {
+                return convolveSpectrumStackToPlaneStack(*sourceStack,
+                                                         *kernelStack,
+                                                         width,
+                                                         height,
+                                                         paddedWidth,
+                                                         paddedHeight,
+                                                         zoneCount * binCount,
+                                                         plan.handle(),
+                                                         stream,
+                                                         *tempSpectrum,
+                                                         *planeStack,
+                                                         error);
+            })) {
+            return false;
+        }
+        if (LensDiffTimingEnabled()) {
+            LogLensDiffTimingStage(
+                "cuda-stage-zone-convolution-stack",
+                std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                    std::chrono::steady_clock::now() - convolutionStart)
+                    .count(),
+                "zones=" + std::to_string(zoneCount) +
+                    ",bins=" + std::to_string(binCount));
+        }
+
+        SpectralPlaneSet* weightedPlanes = nullptr;
+        if (!getSpectralPlaneScratch("field-weighted-planes:" + std::to_string(binCount), &weightedPlanes)) {
+            return false;
+        }
+        const auto accumulateStart = std::chrono::steady_clock::now();
+        for (int binIndex = 0; binIndex < binCount; ++binIndex) {
+            accumulateWeightedPlanesStackKernel<<<flatGrid, flatBlock, 0, stream>>>(planeStack->ptr,
+                                                                                     pixelCount,
+                                                                                     width,
+                                                                                     height,
+                                                                                     fieldTileOriginX,
+                                                                                     fieldTileOriginY,
+                                                                                     fieldFrameX1,
+                                                                                     fieldFrameY1,
+                                                                                     fieldFrameWidth,
+                                                                                     fieldFrameHeight,
+                                                                                     zoneCount,
+                                                                                     binCount,
+                                                                                     binIndex,
+                                                                                     weightedPlanes->bins[static_cast<std::size_t>(binIndex)].ptr);
+            if (!checkCuda(cudaGetLastError(), "accumulateWeightedPlanesStackKernel", error)) {
+                return false;
+            }
+        }
+        for (int binIndex = binCount; binIndex < kLensDiffMaxSpectralBins; ++binIndex) {
+            if (!checkCuda(cudaMemsetAsync(weightedPlanes->bins[static_cast<std::size_t>(binIndex)].ptr,
+                                           0,
+                                           pixelCount * sizeof(float),
+                                           stream),
+                           "cudaMemsetAsync-field-weighted-plane-zero",
+                           error)) {
+                return false;
+            }
+        }
+        if (LensDiffTimingEnabled()) {
+            LogLensDiffTimingStage(
+                "cuda-stage-zone-weighted-accumulate",
+                std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                    std::chrono::steady_clock::now() - accumulateStart)
+                    .count(),
+                "zones=" + std::to_string(zoneCount) +
+                    ",bins=" + std::to_string(binCount));
+        }
+
+        if (!allocatePlaneSet(*outPlaneSet)) {
+            if (error) *error = "cuda-alloc-field-stacked-effect";
+            return false;
+        }
+        SpectralMapConfigGpu mapConfig {};
+        mapConfig.binCount = spectrumConfig.binCount;
+        for (int matrixIndex = 0; matrixIndex < kLensDiffMaxSpectralBins * 3; ++matrixIndex) {
+            mapConfig.naturalMatrix[static_cast<std::size_t>(matrixIndex)] = spectrumConfig.naturalMatrix[static_cast<std::size_t>(matrixIndex)];
+            mapConfig.styleMatrix[static_cast<std::size_t>(matrixIndex)] = spectrumConfig.styleMatrix[static_cast<std::size_t>(matrixIndex)];
+        }
+        mapSpectralKernel<<<flatGrid, flatBlock, 0, stream>>>(
+            weightedPlanes->bins[0].ptr, weightedPlanes->bins[1].ptr, weightedPlanes->bins[2].ptr,
+            weightedPlanes->bins[3].ptr, weightedPlanes->bins[4].ptr, weightedPlanes->bins[5].ptr,
+            weightedPlanes->bins[6].ptr, weightedPlanes->bins[7].ptr, weightedPlanes->bins[8].ptr,
+            pixelCount,
+            mapConfig,
+            static_cast<float>(std::clamp(params.spectrumForce, 0.0, 1.0)),
+            static_cast<float>(std::max(0.0, params.spectrumSaturation)),
+            params.chromaticAffectsLuma ? 1 : 0,
+            outPlaneSet->r.ptr, outPlaneSet->g.ptr, outPlaneSet->b.ptr);
+        return checkCuda(cudaGetLastError(), "mapSpectralKernel-field-stacked", error);
+    };
+    auto renderFieldZonesSpectralMicroBatched = [&](FieldEffectKind effectKind, PlaneSet* outPlaneSet) -> bool {
+        if (outPlaneSet == nullptr || !fieldPlan.canonical3x3 || params.spectralMode == LensDiffSpectralMode::Mono) {
+            return false;
+        }
+        const int zoneCount = static_cast<int>(fieldPlan.zones.size());
+        const int binCount = std::min<int>(static_cast<int>(fieldPlan.zones.front()->bins.size()), kLensDiffMaxSpectralBins);
+        int maxKernelSize = 1;
+        for (const LensDiffFieldZoneCache* zone : fieldPlan.zones) {
+            for (int binIndex = 0; binIndex < binCount; ++binIndex) {
+                maxKernelSize = std::max(maxKernelSize,
+                                         kernelForEffect(zone->bins[static_cast<std::size_t>(binIndex)], effectKind).size);
+            }
+        }
+        const int paddedWidth = nextPowerOfTwo(width + maxKernelSize - 1);
+        const int paddedHeight = nextPowerOfTwo(height + maxKernelSize - 1);
+        DeviceBuffer<cufftComplex>* driverSpectrum = nullptr;
+        if (!getScalarSourceSpectrum(redistributedDriver, paddedWidth, paddedHeight, &driverSpectrum)) {
+            return false;
+        }
+        SpectralPlaneSet* weightedPlanes = nullptr;
+        if (!getSpectralPlaneScratch("field-weighted-planes:" + std::to_string(binCount), &weightedPlanes)) {
+            return false;
+        }
+        for (int binIndex = 0; binIndex < kLensDiffMaxSpectralBins; ++binIndex) {
+            if (!checkCuda(cudaMemsetAsync(weightedPlanes->bins[static_cast<std::size_t>(binIndex)].ptr,
+                                           0,
+                                           pixelCount * sizeof(float),
+                                           stream),
+                           "cudaMemsetAsync-field-weighted-plane-reset",
+                           error)) {
+                return false;
+            }
+        }
+
+        const std::uint64_t perZoneStackBytes = std::max<std::uint64_t>(
+            1ULL,
+            estimateStackWorkingBytes(paddedWidth, paddedHeight, binCount));
+        const std::uint64_t targetBudgetBytes = kFieldStackBudgetBytes * 3ULL / 4ULL;
+        int chunkZoneCount = static_cast<int>(targetBudgetBytes / perZoneStackBytes);
+        chunkZoneCount = std::max(1, std::min(zoneCount, chunkZoneCount));
+        timing.fieldZoneBatchDepth = std::max(timing.fieldZoneBatchDepth, chunkZoneCount);
+
+        const auto convolutionStart = std::chrono::steady_clock::now();
+        const std::size_t paddedCount = static_cast<std::size_t>(paddedWidth) * paddedHeight;
+        for (int zoneBase = 0; zoneBase < zoneCount; zoneBase += chunkZoneCount) {
+            const int activeZoneCount = std::min(chunkZoneCount, zoneCount - zoneBase);
+            DeviceBuffer<cufftComplex>* sourceStack = nullptr;
+            DeviceBuffer<cufftComplex>* kernelStack = nullptr;
+            if (!getReplicatedSpectrumStack(*driverSpectrum,
+                                            "field-driver-chunk:" + std::to_string(paddedWidth) + "x" +
+                                                std::to_string(paddedHeight) + ":" +
+                                                std::to_string(activeZoneCount * binCount),
+                                            1,
+                                            activeZoneCount * binCount,
+                                            paddedWidth,
+                                            paddedHeight,
+                                            &sourceStack) ||
+                !buildFieldKernelSpectrumStack(effectKind,
+                                               paddedWidth,
+                                               paddedHeight,
+                                               binCount,
+                                               1,
+                                               zoneBase,
+                                               activeZoneCount,
+                                               &kernelStack)) {
+                return false;
+            }
+            CudaPlanLease plan;
+            if (!getPlanForDims(paddedWidth, paddedHeight, activeZoneCount * binCount, &plan)) {
+                return false;
+            }
+            DeviceBuffer<cufftComplex>* tempSpectrum = nullptr;
+            DeviceBuffer<float>* planeStack = nullptr;
+            if (!getComplexScratch("field-micro-temp-spectrum:" + std::to_string(paddedWidth) + "x" +
+                                       std::to_string(paddedHeight) + ":" + std::to_string(activeZoneCount * binCount),
+                                   paddedCount * static_cast<std::size_t>(activeZoneCount * binCount),
+                                   &tempSpectrum) ||
+                !getFloatScratch("field-micro-plane-stack:" + std::to_string(paddedWidth) + "x" +
+                                     std::to_string(paddedHeight) + ":" + std::to_string(activeZoneCount) + ":" +
+                                     std::to_string(binCount),
+                                 pixelCount * static_cast<std::size_t>(activeZoneCount * binCount),
+                                 &planeStack)) {
+                return false;
+            }
+            if (!timeCall(timing.convolutionMs, [&] {
+                    return convolveSpectrumStackToPlaneStack(*sourceStack,
+                                                             *kernelStack,
+                                                             width,
+                                                             height,
+                                                             paddedWidth,
+                                                             paddedHeight,
+                                                             activeZoneCount * binCount,
+                                                             plan.handle(),
+                                                             stream,
+                                                             *tempSpectrum,
+                                                             *planeStack,
+                                                             error);
+                })) {
+                return false;
+            }
+            for (int localZoneIndex = 0; localZoneIndex < activeZoneCount; ++localZoneIndex) {
+                const LensDiffFieldZoneCache* zone = fieldPlan.zones[static_cast<std::size_t>(zoneBase + localZoneIndex)];
+                if (zone == nullptr) {
+                    continue;
+                }
+                for (int binIndex = 0; binIndex < binCount; ++binIndex) {
+                    float* srcPlane = planeStack->ptr +
+                        pixelCount * (static_cast<std::size_t>(localZoneIndex) * static_cast<std::size_t>(binCount) +
+                                      static_cast<std::size_t>(binIndex));
+                    accumulateWeightedPlaneKernel<<<grid2d, block2d, 0, stream>>>(srcPlane,
+                                                                                   width,
+                                                                                   height,
+                                                                                   fieldTileOriginX,
+                                                                                   fieldTileOriginY,
+                                                                                   fieldFrameX1,
+                                                                                   fieldFrameY1,
+                                                                                   fieldFrameWidth,
+                                                                                   fieldFrameHeight,
+                                                                                   zone->zoneX,
+                                                                                   zone->zoneY,
+                                                                                   1.0f,
+                                                                                   weightedPlanes->bins[static_cast<std::size_t>(binIndex)].ptr);
+                    if (!checkCuda(cudaGetLastError(), "accumulateWeightedPlaneKernel", error)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        if (LensDiffTimingEnabled()) {
+            LogLensDiffTimingStage(
+                "cuda-stage-zone-convolution-stack",
+                std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                    std::chrono::steady_clock::now() - convolutionStart)
+                    .count(),
+                "zones=" + std::to_string(zoneCount) +
+                    ",bins=" + std::to_string(binCount) +
+                    ",mode=" + std::string(chunkZoneCount > 1 ? "chunked" : "micro") +
+                    ",chunkZones=" + std::to_string(chunkZoneCount));
+        }
+
+        if (!allocatePlaneSet(*outPlaneSet)) {
+            if (error) *error = "cuda-alloc-field-micro-effect";
+            return false;
+        }
+        SpectralMapConfigGpu mapConfig {};
+        mapConfig.binCount = spectrumConfig.binCount;
+        for (int matrixIndex = 0; matrixIndex < kLensDiffMaxSpectralBins * 3; ++matrixIndex) {
+            mapConfig.naturalMatrix[static_cast<std::size_t>(matrixIndex)] = spectrumConfig.naturalMatrix[static_cast<std::size_t>(matrixIndex)];
+            mapConfig.styleMatrix[static_cast<std::size_t>(matrixIndex)] = spectrumConfig.styleMatrix[static_cast<std::size_t>(matrixIndex)];
+        }
+        mapSpectralKernel<<<flatGrid, flatBlock, 0, stream>>>(
+            weightedPlanes->bins[0].ptr, weightedPlanes->bins[1].ptr, weightedPlanes->bins[2].ptr,
+            weightedPlanes->bins[3].ptr, weightedPlanes->bins[4].ptr, weightedPlanes->bins[5].ptr,
+            weightedPlanes->bins[6].ptr, weightedPlanes->bins[7].ptr, weightedPlanes->bins[8].ptr,
+            pixelCount,
+            mapConfig,
+            static_cast<float>(std::clamp(params.spectrumForce, 0.0, 1.0)),
+            static_cast<float>(std::max(0.0, params.spectrumSaturation)),
+            params.chromaticAffectsLuma ? 1 : 0,
+            outPlaneSet->r.ptr, outPlaneSet->g.ptr, outPlaneSet->b.ptr);
+        return checkCuda(cudaGetLastError(), "mapSpectralKernel-field-micro", error);
+    };
+    auto allocatePlaneSetStack = [&](PlaneSet& set, int stackDepth) -> bool {
+        const std::size_t stackCount = pixelCount * static_cast<std::size_t>(stackDepth);
+        return set.r.allocate(stackCount) && set.g.allocate(stackCount) && set.b.allocate(stackCount);
+    };
+    auto packPlaneTripletsToRgbStack = [&](const DeviceBuffer<float>& planeStack,
+                                           int zoneCount,
+                                           PlaneSet* outStack) -> bool {
+        if (outStack == nullptr || !allocatePlaneSetStack(*outStack, zoneCount)) {
+            if (error) *error = "cuda-alloc-pack-rgb-stack";
+            return false;
+        }
+        const int block = 256;
+        const int grid = static_cast<int>(((pixelCount * static_cast<std::size_t>(zoneCount)) + block - 1) / block);
+        packPlaneTripletsToRgbStackKernel<<<grid, block, 0, stream>>>(planeStack.ptr,
+                                                                      pixelCount,
+                                                                      zoneCount,
+                                                                      outStack->r.ptr,
+                                                                      outStack->g.ptr,
+                                                                      outStack->b.ptr);
+        return checkCuda(cudaGetLastError(), "packPlaneTripletsToRgbStackKernel", error);
+    };
+    auto applyShoulderStack = [&](PlaneSet& stack, int stackDepth, float shoulder) -> bool {
+        if (shoulder <= 0.0f) {
+            return true;
+        }
+        const std::size_t stackCount = pixelCount * static_cast<std::size_t>(stackDepth);
+        const int block = 256;
+        const int grid = static_cast<int>((stackCount + block - 1) / block);
+        applyShoulderStackKernel<<<grid, block, 0, stream>>>(stack.r.ptr,
+                                                             stack.g.ptr,
+                                                             stack.b.ptr,
+                                                             pixelCount,
+                                                             stackDepth,
+                                                             shoulder);
+        return checkCuda(cudaGetLastError(), "applyShoulderStackKernel", error);
+    };
+    auto combineRgbStack = [&](const PlaneSet& a,
+                               const PlaneSet& b,
+                               int stackDepth,
+                               PlaneSet* outStack) -> bool {
+        if (outStack == nullptr || !allocatePlaneSetStack(*outStack, stackDepth)) {
+            if (error) *error = "cuda-alloc-combine-rgb-stack";
+            return false;
+        }
+        const std::size_t stackCount = pixelCount * static_cast<std::size_t>(stackDepth);
+        const int block = 256;
+        const int grid = static_cast<int>((stackCount + block - 1) / block);
+        combineRgbStackKernel<<<grid, block, 0, stream>>>(a.r.ptr,
+                                                          a.g.ptr,
+                                                          a.b.ptr,
+                                                          b.r.ptr,
+                                                          b.g.ptr,
+                                                          b.b.ptr,
+                                                          pixelCount,
+                                                          stackDepth,
+                                                          static_cast<float>(std::max(0.0, params.coreGain)),
+                                                          static_cast<float>(std::max(0.0, params.structureGain)),
+                                                          outStack->r.ptr,
+                                                          outStack->g.ptr,
+                                                          outStack->b.ptr);
+        return checkCuda(cudaGetLastError(), "combineRgbStackKernel", error);
+    };
+    auto accumulateWeightedRgbStack = [&](const PlaneSet& stack,
+                                          int zoneCount,
+                                          PlaneSet* outSet) -> bool {
+        if (outSet == nullptr || !allocatePlaneSet(*outSet)) {
+            if (error) *error = "cuda-alloc-accumulate-rgb-stack";
+            return false;
+        }
+        const int block = 256;
+        const int grid = static_cast<int>((pixelCount + block - 1) / block);
+        accumulateWeightedRgbStackKernel<<<grid, block, 0, stream>>>(stack.r.ptr,
+                                                                      stack.g.ptr,
+                                                                      stack.b.ptr,
+                                                                      width,
+                                                                      height,
+                                                                      fieldTileOriginX,
+                                                                      fieldTileOriginY,
+                                                                      fieldFrameX1,
+                                                                      fieldFrameY1,
+                                                                      fieldFrameWidth,
+                                                                      fieldFrameHeight,
+                                                                      pixelCount,
+                                                                      zoneCount,
+                                                                      outSet->r.ptr,
+                                                                      outSet->g.ptr,
+                                                                     outSet->b.ptr);
+        return checkCuda(cudaGetLastError(), "accumulateWeightedRgbStackKernel", error);
+    };
+    auto mapSpectralPlaneStackToRgbStack = [&](const DeviceBuffer<float>& planeStack,
+                                               int zoneCount,
+                                               int binCount,
+                                               PlaneSet* outStack) -> bool {
+        if (outStack == nullptr || !allocatePlaneSetStack(*outStack, zoneCount)) {
+            if (error) *error = "cuda-alloc-map-spectral-stack";
+            return false;
+        }
+        SpectralMapConfigGpu mapConfig {};
+        mapConfig.binCount = spectrumConfig.binCount;
+        for (int matrixIndex = 0; matrixIndex < kLensDiffMaxSpectralBins * 3; ++matrixIndex) {
+            mapConfig.naturalMatrix[static_cast<std::size_t>(matrixIndex)] = spectrumConfig.naturalMatrix[static_cast<std::size_t>(matrixIndex)];
+            mapConfig.styleMatrix[static_cast<std::size_t>(matrixIndex)] = spectrumConfig.styleMatrix[static_cast<std::size_t>(matrixIndex)];
+        }
+        const int block = 256;
+        const int grid = static_cast<int>(((pixelCount * static_cast<std::size_t>(zoneCount)) + block - 1) / block);
+        mapSpectralStackKernel<<<grid, block, 0, stream>>>(planeStack.ptr,
+                                                           pixelCount,
+                                                           zoneCount,
+                                                           binCount,
+                                                           mapConfig,
+                                                           static_cast<float>(std::clamp(params.spectrumForce, 0.0, 1.0)),
+                                                           static_cast<float>(std::max(0.0, params.spectrumSaturation)),
+                                                           params.chromaticAffectsLuma ? 1 : 0,
+                                                           outStack->r.ptr,
+                                                           outStack->g.ptr,
+                                                           outStack->b.ptr);
+        return checkCuda(cudaGetLastError(), "mapSpectralStackKernel", error);
+    };
+    auto convolveMonoFieldStack = [&](FieldEffectKind effectKind, PlaneSet* outStack) -> bool {
+        if (outStack == nullptr || !fieldPlan.canonical3x3) {
+            return false;
+        }
+        const int zoneCount = static_cast<int>(fieldPlan.zones.size());
+        int maxKernelSize = 1;
+        for (const LensDiffFieldZoneCache* zone : fieldPlan.zones) {
+            maxKernelSize = std::max(maxKernelSize, kernelForEffect(zone->bins.front(), effectKind).size);
+        }
+        const int paddedWidth = nextPowerOfTwo(width + maxKernelSize - 1);
+        const int paddedHeight = nextPowerOfTwo(height + maxKernelSize - 1);
+        DeviceBuffer<cufftComplex>* rgbTripletSpectrum = nullptr;
+        DeviceBuffer<cufftComplex>* sourceStack = nullptr;
+        DeviceBuffer<cufftComplex>* kernelStack = nullptr;
+        if (!getRgbTripletSpectrumStack(paddedWidth, paddedHeight, &rgbTripletSpectrum) ||
+            !getReplicatedSpectrumStack(*rgbTripletSpectrum,
+                                        "field-rgb-triplet-replicated:" + std::to_string(paddedWidth) + "x" +
+                                            std::to_string(paddedHeight) + ":" + std::to_string(zoneCount * 3),
+                                        3,
+                                        zoneCount * 3,
+                                        paddedWidth,
+                                        paddedHeight,
+                                        &sourceStack)) {
+            return false;
+        }
+        if (!buildFieldKernelSpectrumStack(effectKind, paddedWidth, paddedHeight, 1, 3, 0, zoneCount, &kernelStack)) {
+            return false;
+        }
+        CudaPlanLease plan;
+        if (!getPlanForDims(paddedWidth, paddedHeight, zoneCount * 3, &plan)) {
+            return false;
+        }
+        const std::size_t paddedCount = static_cast<std::size_t>(paddedWidth) * paddedHeight;
+        DeviceBuffer<cufftComplex>* tempSpectrum = nullptr;
+        DeviceBuffer<float>* planeStack = nullptr;
+        if (!getComplexScratch("field-mono-temp-spectrum:" + std::to_string(paddedWidth) + "x" +
+                                   std::to_string(paddedHeight) + ":" + std::to_string(zoneCount * 3),
+                               paddedCount * static_cast<std::size_t>(zoneCount * 3),
+                               &tempSpectrum) ||
+            !getFloatScratch("field-mono-plane-stack:" + std::to_string(paddedWidth) + "x" +
+                                 std::to_string(paddedHeight) + ":" + std::to_string(zoneCount),
+                             pixelCount * static_cast<std::size_t>(zoneCount * 3),
+                             &planeStack)) {
+            return false;
+        }
+        if (!timeCall(timing.convolutionMs, [&] {
+                return convolveSpectrumStackToPlaneStack(*sourceStack,
+                                                         *kernelStack,
+                                                         width,
+                                                         height,
+                                                         paddedWidth,
+                                                         paddedHeight,
+                                                         zoneCount * 3,
+                                                          plan.handle(),
+                                                         stream,
+                                                         *tempSpectrum,
+                                                         *planeStack,
+                                                         error);
+            })) {
+            return false;
+        }
+        if (!packPlaneTripletsToRgbStack(*planeStack, zoneCount, outStack)) {
+            return false;
+        }
+        return true;
+    };
+    auto convolvePlaneSetStable = [&](const DeviceBuffer<float>& srcRPlane,
+                                      const DeviceBuffer<float>& srcGPlane,
+                                      const DeviceBuffer<float>& srcBPlane,
+                                      const LensDiffKernel& kernel,
+                                      PlaneSet& dst,
+                                      const char* stagePrefix) -> bool {
         const int paddedWidth = nextPowerOfTwo(width + kernel.size - 1);
         const int paddedHeight = nextPowerOfTwo(height + kernel.size - 1);
         cufftHandle plan = 0;
@@ -2730,11 +5988,10 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         }
         return ok;
     };
-
-    auto renderFromBins = [&](const std::vector<LensDiffPsfBin>& bins,
-                              PlaneSet& outEffect,
-                              PlaneSet* outCore,
-                              PlaneSet* outStructure) -> bool {
+    auto renderFromBinsStable = [&](const std::vector<LensDiffPsfBin>& bins,
+                                    PlaneSet& outEffect,
+                                    PlaneSet* outCore,
+                                    PlaneSet* outStructure) -> bool {
         if (!allocatePlaneSet(outEffect)) {
             if (error) *error = "cuda-alloc-zone-effect";
             return false;
@@ -2754,13 +6011,16 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                 return false;
             }
 
-            if (!splitMode && !convolvePlaneSet(redistributedR, redistributedG, redistributedB, bins.front().full, fullEffect, "cuda-convolve-zone-full")) {
+            if (!splitMode &&
+                !convolvePlaneSetStable(redistributedR, redistributedG, redistributedB, bins.front().full, fullEffect, "cuda-convolve-zone-full")) {
                 return false;
             }
-            if (localNeedCore && !convolvePlaneSet(redistributedR, redistributedG, redistributedB, bins.front().core, *outCore, "cuda-convolve-zone-core")) {
+            if (localNeedCore &&
+                !convolvePlaneSetStable(redistributedR, redistributedG, redistributedB, bins.front().core, *outCore, "cuda-convolve-zone-core")) {
                 return false;
             }
-            if (localNeedStructure && !convolvePlaneSet(redistributedR, redistributedG, redistributedB, bins.front().structure, *outStructure, "cuda-convolve-zone-structure")) {
+            if (localNeedStructure &&
+                !convolvePlaneSetStable(redistributedR, redistributedG, redistributedB, bins.front().structure, *outStructure, "cuda-convolve-zone-structure")) {
                 return false;
             }
 
@@ -2811,7 +6071,7 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             }
             return true;
         };
-        auto convolveBins = [&](const std::vector<LensDiffKernel>& kernels, SpectralPlaneSet& dst) -> bool {
+        auto convolveBinsStable = [&](const std::vector<LensDiffKernel>& kernels, SpectralPlaneSet& dst) -> bool {
             const int activeBins = std::min<int>(static_cast<int>(kernels.size()), kLensDiffMaxSpectralBins);
             for (int i = 0; i < activeBins; ++i) {
                 if (!makeKernelSpectrum(kernels[static_cast<std::size_t>(i)],
@@ -2848,7 +6108,7 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             }
             return true;
         };
-        auto mapBins = [&](const SpectralPlaneSet& srcBins, PlaneSet& dst) -> bool {
+        auto mapBinsStable = [&](const SpectralPlaneSet& srcBins, PlaneSet& dst) -> bool {
             SpectralMapConfigGpu mapConfig {};
             mapConfig.binCount = zoneSpectrumConfig.binCount;
             for (int i = 0; i < kLensDiffMaxSpectralBins * 3; ++i) {
@@ -2891,28 +6151,28 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             std::vector<LensDiffKernel> kernels;
             kernels.reserve(bins.size());
             for (const auto& bin : bins) kernels.push_back(bin.full);
-            ok = convolveBins(kernels, fullBins);
+            ok = convolveBinsStable(kernels, fullBins);
         }
         if (ok && localNeedCore) {
             std::vector<LensDiffKernel> kernels;
             kernels.reserve(bins.size());
             for (const auto& bin : bins) kernels.push_back(bin.core);
-            ok = convolveBins(kernels, coreBins);
+            ok = convolveBinsStable(kernels, coreBins);
         }
         if (ok && localNeedStructure) {
             std::vector<LensDiffKernel> kernels;
             kernels.reserve(bins.size());
             for (const auto& bin : bins) kernels.push_back(bin.structure);
-            ok = convolveBins(kernels, structureBins);
+            ok = convolveBinsStable(kernels, structureBins);
         }
         if (ok && !splitMode) {
-            ok = mapBins(fullBins, outEffect);
+            ok = mapBinsStable(fullBins, outEffect);
         }
         if (ok && localNeedCore) {
-            ok = mapBins(coreBins, *outCore);
+            ok = mapBinsStable(coreBins, *outCore);
         }
         if (ok && localNeedStructure) {
-            ok = mapBins(structureBins, *outStructure);
+            ok = mapBinsStable(structureBins, *outStructure);
         }
         if (!ok) {
             cufftDestroy(plan);
@@ -2948,80 +6208,444 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         cufftDestroy(plan);
         return ok;
     };
-
-    PlaneSet effect;
-    PlaneSet coreEffect;
-    PlaneSet structureEffect;
-    if (cache.fieldZones.empty()) {
-        if (!renderFromBins(cache.bins,
-                            effect,
-                            needCore ? &coreEffect : nullptr,
-                            needStructure ? &structureEffect : nullptr)) {
+    auto renderFieldZonesStackedMono = [&](FieldEffectKind effectKind, PlaneSet* outPlaneSet) -> bool {
+        PlaneSet* rgbStack = nullptr;
+        const int zoneCount = static_cast<int>(fieldPlan.zones.size());
+        if (!getPlaneSetScratch("field-mono-rgb-stack:" + std::to_string(static_cast<int>(effectKind)),
+                                pixelCount * static_cast<std::size_t>(zoneCount),
+                                &rgbStack)) {
             return false;
         }
-    } else {
-        if (!allocatePlaneSet(effect) ||
-            (needCore && !allocatePlaneSet(coreEffect)) ||
-            (needStructure && !allocatePlaneSet(structureEffect))) {
+        return convolveMonoFieldStack(effectKind, rgbStack) &&
+               accumulateWeightedRgbStack(*rgbStack, zoneCount, outPlaneSet);
+    };
+    auto renderFieldZonesStackedSplit = [&](PlaneSet* outEffect, PlaneSet* outCore, PlaneSet* outStructure) -> bool {
+        if (!fieldPlan.canonical3x3 || outEffect == nullptr) {
+            return false;
+        }
+        const int zoneCount = static_cast<int>(fieldPlan.zones.size());
+        PlaneSet* coreStack = nullptr;
+        PlaneSet* structureStack = nullptr;
+        if (!getPlaneSetScratch("field-split-core-stack", pixelCount * static_cast<std::size_t>(zoneCount), &coreStack) ||
+            !getPlaneSetScratch("field-split-structure-stack", pixelCount * static_cast<std::size_t>(zoneCount), &structureStack)) {
+            return false;
+        }
+        if (params.spectralMode == LensDiffSpectralMode::Mono) {
+            if (!convolveMonoFieldStack(FieldEffectKind::Core, coreStack) ||
+                !convolveMonoFieldStack(FieldEffectKind::Structure, structureStack) ||
+                !applyShoulderStack(*coreStack, zoneCount, static_cast<float>(params.coreShoulder)) ||
+                !applyShoulderStack(*structureStack, zoneCount, static_cast<float>(params.structureShoulder))) {
+                return false;
+            }
+            PlaneSet* effectStack = nullptr;
+            if (!getPlaneSetScratch("field-split-effect-stack", pixelCount * static_cast<std::size_t>(zoneCount), &effectStack) ||
+                !combineRgbStack(*coreStack, *structureStack, zoneCount, effectStack) ||
+                !accumulateWeightedRgbStack(*effectStack, zoneCount, outEffect)) {
+                return false;
+            }
+            if (outCore != nullptr && !accumulateWeightedRgbStack(*coreStack, zoneCount, outCore)) {
+                return false;
+            }
+            if (outStructure != nullptr && !accumulateWeightedRgbStack(*structureStack, zoneCount, outStructure)) {
+                return false;
+            }
+            return true;
+        }
+        DeviceBuffer<float>* corePlaneStack = nullptr;
+        DeviceBuffer<float>* structurePlaneStack = nullptr;
+        int binCount = std::min<int>(static_cast<int>(fieldPlan.zones.front()->bins.size()), kLensDiffMaxSpectralBins);
+        auto convolveSpectralStack = [&](FieldEffectKind effectKind, DeviceBuffer<float>* outPlaneStack) -> bool {
+            int maxKernelSize = 1;
+            for (const LensDiffFieldZoneCache* zone : fieldPlan.zones) {
+                for (int binIndex = 0; binIndex < binCount; ++binIndex) {
+                    maxKernelSize = std::max(maxKernelSize, kernelForEffect(zone->bins[static_cast<std::size_t>(binIndex)], effectKind).size);
+                }
+            }
+            const int paddedWidth = nextPowerOfTwo(width + maxKernelSize - 1);
+            const int paddedHeight = nextPowerOfTwo(height + maxKernelSize - 1);
+            DeviceBuffer<cufftComplex>* driverSpectrum = nullptr;
+            DeviceBuffer<cufftComplex>* sourceStack = nullptr;
+            DeviceBuffer<cufftComplex>* kernelStack = nullptr;
+            if (!getScalarSourceSpectrum(redistributedDriver, paddedWidth, paddedHeight, &driverSpectrum) ||
+                !getReplicatedSpectrumStack(*driverSpectrum,
+                                            "field-split-driver:" + std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) +
+                                                ":" + std::to_string(zoneCount * binCount),
+                                            1,
+                                            zoneCount * binCount,
+                                            paddedWidth,
+                                            paddedHeight,
+                                            &sourceStack) ||
+                !buildFieldKernelSpectrumStack(effectKind, paddedWidth, paddedHeight, binCount, 1, 0, zoneCount, &kernelStack)) {
+                return false;
+            }
+            CudaPlanLease plan;
+            if (!getPlanForDims(paddedWidth, paddedHeight, zoneCount * binCount, &plan)) {
+                return false;
+            }
+            const std::size_t paddedCount = static_cast<std::size_t>(paddedWidth) * paddedHeight;
+            DeviceBuffer<cufftComplex>* tempSpectrum = nullptr;
+            if (!getComplexScratch("field-split-temp-spectrum:" + std::to_string(static_cast<int>(effectKind)) + ":" +
+                                       std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) + ":" +
+                                       std::to_string(zoneCount * binCount),
+                                   paddedCount * static_cast<std::size_t>(zoneCount * binCount),
+                                   &tempSpectrum)) {
+                return false;
+            }
+            return timeCall(timing.convolutionMs, [&] {
+                return convolveSpectrumStackToPlaneStack(*sourceStack,
+                                                         *kernelStack,
+                                                         width,
+                                                         height,
+                                                         paddedWidth,
+                                                         paddedHeight,
+                                                         zoneCount * binCount,
+                                                          plan.handle(),
+                                                         stream,
+                                                         *tempSpectrum,
+                                                         *outPlaneStack,
+                                                         error);
+            });
+        };
+        if (!getFloatScratch("field-split-plane-stack-core:" + std::to_string(binCount),
+                             pixelCount * static_cast<std::size_t>(zoneCount * binCount),
+                             &corePlaneStack) ||
+            !getFloatScratch("field-split-plane-stack-structure:" + std::to_string(binCount),
+                             pixelCount * static_cast<std::size_t>(zoneCount * binCount),
+                             &structurePlaneStack) ||
+            !convolveSpectralStack(FieldEffectKind::Core, corePlaneStack) ||
+            !convolveSpectralStack(FieldEffectKind::Structure, structurePlaneStack) ||
+            !mapSpectralPlaneStackToRgbStack(*corePlaneStack, zoneCount, binCount, coreStack) ||
+            !mapSpectralPlaneStackToRgbStack(*structurePlaneStack, zoneCount, binCount, structureStack) ||
+            !applyShoulderStack(*coreStack, zoneCount, static_cast<float>(params.coreShoulder)) ||
+            !applyShoulderStack(*structureStack, zoneCount, static_cast<float>(params.structureShoulder))) {
+            return false;
+        }
+        PlaneSet* effectStack = nullptr;
+        if (!getPlaneSetScratch("field-split-effect-stack", pixelCount * static_cast<std::size_t>(zoneCount), &effectStack) ||
+            !combineRgbStack(*coreStack, *structureStack, zoneCount, effectStack) ||
+            !accumulateWeightedRgbStack(*effectStack, zoneCount, outEffect)) {
+            return false;
+        }
+        if (outCore != nullptr && !accumulateWeightedRgbStack(*coreStack, zoneCount, outCore)) {
+            return false;
+        }
+        if (outStructure != nullptr && !accumulateWeightedRgbStack(*structureStack, zoneCount, outStructure)) {
+            return false;
+        }
+        return true;
+    };
+    auto accumulateFieldZone = [&](const PlaneSet& src, int zoneX, int zoneY, float gain, PlaneSet& dst) -> bool {
+        accumulateWeightedRgbLegacyKernel<<<grid2d, block2d, 0, stream>>>(
+            src.r.ptr, src.g.ptr, src.b.ptr,
+            width, height,
+            zoneX, zoneY, gain,
+            dst.r.ptr, dst.g.ptr, dst.b.ptr);
+        return checkCuda(cudaGetLastError(), "accumulateWeightedRgbLegacyKernel-field-zone", error);
+    };
+    auto renderFieldZonesLegacy = [&](PlaneSet* outEffect, PlaneSet* outCore, PlaneSet* outStructure) -> bool {
+        if (outEffect == nullptr) {
+            return false;
+        }
+        if (!allocatePlaneSet(*outEffect) ||
+            (outCore != nullptr && !allocatePlaneSet(*outCore)) ||
+            (outStructure != nullptr && !allocatePlaneSet(*outStructure))) {
             if (error) *error = "cuda-alloc-field-accum";
             return false;
         }
-        if (!clearPlaneSet(effect, "cudaMemsetAsync-field-effect") ||
-            (needCore && !clearPlaneSet(coreEffect, "cudaMemsetAsync-field-core")) ||
-            (needStructure && !clearPlaneSet(structureEffect, "cudaMemsetAsync-field-structure"))) {
+        if (!clearPlaneSet(*outEffect, "cudaMemsetAsync-field-effect") ||
+            (outCore != nullptr && !clearPlaneSet(*outCore, "cudaMemsetAsync-field-core")) ||
+            (outStructure != nullptr && !clearPlaneSet(*outStructure, "cudaMemsetAsync-field-structure"))) {
             return false;
         }
         for (const auto& zone : cache.fieldZones) {
             PlaneSet zoneEffect;
             PlaneSet zoneCore;
             PlaneSet zoneStructure;
-            if (!renderFromBins(zone.bins,
-                                zoneEffect,
-                                needCore ? &zoneCore : nullptr,
-                                needStructure ? &zoneStructure : nullptr)) {
+            if (!renderFromBinsStable(zone.bins,
+                                      zoneEffect,
+                                      outCore != nullptr ? &zoneCore : nullptr,
+                                      outStructure != nullptr ? &zoneStructure : nullptr)) {
                 return false;
             }
-            accumulateWeightedRgbKernel<<<grid2d, block2d, 0, stream>>>(
-                zoneEffect.r.ptr, zoneEffect.g.ptr, zoneEffect.b.ptr,
-                width, height, zone.zoneX, zone.zoneY, 1.0f,
-                effect.r.ptr, effect.g.ptr, effect.b.ptr);
-            if (!checkCuda(cudaGetLastError(), "accumulateWeightedRgbKernel-effect", error)) {
+            if (!accumulateFieldZone(zoneEffect, zone.zoneX, zone.zoneY, 1.0f, *outEffect) ||
+                (outCore != nullptr && !accumulateFieldZone(zoneCore, zone.zoneX, zone.zoneY, 1.0f, *outCore)) ||
+                (outStructure != nullptr && !accumulateFieldZone(zoneStructure, zone.zoneX, zone.zoneY, 1.0f, *outStructure))) {
                 return false;
-            }
-            if (needCore) {
-                accumulateWeightedRgbKernel<<<grid2d, block2d, 0, stream>>>(
-                    zoneCore.r.ptr, zoneCore.g.ptr, zoneCore.b.ptr,
-                    width, height, zone.zoneX, zone.zoneY, 1.0f,
-                    coreEffect.r.ptr, coreEffect.g.ptr, coreEffect.b.ptr);
-                if (!checkCuda(cudaGetLastError(), "accumulateWeightedRgbKernel-core", error)) {
-                    return false;
-                }
-            }
-            if (needStructure) {
-                accumulateWeightedRgbKernel<<<grid2d, block2d, 0, stream>>>(
-                    zoneStructure.r.ptr, zoneStructure.g.ptr, zoneStructure.b.ptr,
-                    width, height, zone.zoneX, zone.zoneY, 1.0f,
-                    structureEffect.r.ptr, structureEffect.g.ptr, structureEffect.b.ptr);
-                if (!checkCuda(cudaGetLastError(), "accumulateWeightedRgbKernel-structure", error)) {
-                    return false;
-                }
             }
         }
+        return true;
+    };
+    auto downloadDeviceBuffer = [&](const DeviceBuffer<float>& buffer, std::vector<float>* host) -> bool {
+        if (host == nullptr) {
+            return false;
+        }
+        host->assign(buffer.count, 0.0f);
+        if (buffer.count == 0) {
+            return true;
+        }
+        if (!checkCuda(cudaMemcpyAsync(host->data(),
+                                       buffer.ptr,
+                                       buffer.count * sizeof(float),
+                                       cudaMemcpyDeviceToHost,
+                                       stream),
+                       "cudaMemcpyAsync-download-validation",
+                       error)) {
+            return false;
+        }
+        ++timing.hostSyncCount;
+        return checkCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize-validation", error);
+    };
+    auto comparePlaneBuffers = [&](const DeviceBuffer<float>& fast,
+                                   const DeviceBuffer<float>& reference,
+                                   float* outMaxAbs,
+                                   std::uint64_t* outFastHash,
+                                   std::uint64_t* outReferenceHash) -> bool {
+        std::vector<float> fastHost;
+        std::vector<float> referenceHost;
+        if (!downloadDeviceBuffer(fast, &fastHost) || !downloadDeviceBuffer(reference, &referenceHost)) {
+            return false;
+        }
+        float maxAbs = 0.0f;
+        const std::size_t count = std::min(fastHost.size(), referenceHost.size());
+        for (std::size_t index = 0; index < count; ++index) {
+            maxAbs = std::max(maxAbs, std::abs(fastHost[index] - referenceHost[index]));
+        }
+        if (outMaxAbs != nullptr) {
+            *outMaxAbs = maxAbs;
+        }
+        if (outFastHash != nullptr) {
+            *outFastHash = hashBytesFnv1a64(fastHost.data(), fastHost.size() * sizeof(float));
+        }
+        if (outReferenceHash != nullptr) {
+            *outReferenceHash = hashBytesFnv1a64(referenceHost.data(), referenceHost.size() * sizeof(float));
+        }
+        return true;
+    };
+    auto comparePlaneSets = [&](const PlaneSet& fast,
+                                const PlaneSet& reference,
+                                float* outMaxAbs,
+                                const char* label) -> bool {
+        float maxAbs = 0.0f;
+        std::uint64_t fastHashR = 0;
+        std::uint64_t fastHashG = 0;
+        std::uint64_t fastHashB = 0;
+        std::uint64_t referenceHashR = 0;
+        std::uint64_t referenceHashG = 0;
+        std::uint64_t referenceHashB = 0;
+        float planeMaxR = 0.0f;
+        float planeMaxG = 0.0f;
+        float planeMaxB = 0.0f;
+        if (!comparePlaneBuffers(fast.r, reference.r, &planeMaxR, &fastHashR, &referenceHashR) ||
+            !comparePlaneBuffers(fast.g, reference.g, &planeMaxG, &fastHashG, &referenceHashG) ||
+            !comparePlaneBuffers(fast.b, reference.b, &planeMaxB, &fastHashB, &referenceHashB)) {
+            return false;
+        }
+        maxAbs = std::max(planeMaxR, std::max(planeMaxG, planeMaxB));
+        if (outMaxAbs != nullptr) {
+            *outMaxAbs = std::max(*outMaxAbs, maxAbs);
+        }
+        if (!timing.validationNote.empty()) {
+            timing.validationNote += ",";
+        }
+        timing.validationNote += std::string(label) + "HashFast=" + std::to_string(static_cast<unsigned long long>(fastHashR ^ fastHashG ^ fastHashB));
+        timing.validationNote += "," + std::string(label) + "HashLegacy=" + std::to_string(static_cast<unsigned long long>(referenceHashR ^ referenceHashG ^ referenceHashB));
+        return true;
+    };
+    auto estimateStackedFieldBytes = [&]() -> std::uint64_t {
+        if (!fieldPlan.canonical3x3) {
+            return 0;
+        }
+        const int zoneCount = static_cast<int>(fieldPlan.zones.size());
+        if (splitMode) {
+            if (params.spectralMode == LensDiffSpectralMode::Mono) {
+                int maxCoreKernel = 1;
+                int maxStructureKernel = 1;
+                for (const LensDiffFieldZoneCache* zone : fieldPlan.zones) {
+                    maxCoreKernel = std::max(maxCoreKernel, kernelForEffect(zone->bins.front(), FieldEffectKind::Core).size);
+                    maxStructureKernel = std::max(maxStructureKernel, kernelForEffect(zone->bins.front(), FieldEffectKind::Structure).size);
+                }
+                const int paddedWidthCore = nextPowerOfTwo(width + maxCoreKernel - 1);
+                const int paddedHeightCore = nextPowerOfTwo(height + maxCoreKernel - 1);
+                const int paddedWidthStructure = nextPowerOfTwo(width + maxStructureKernel - 1);
+                const int paddedHeightStructure = nextPowerOfTwo(height + maxStructureKernel - 1);
+                return estimateStackWorkingBytes(paddedWidthCore, paddedHeightCore, zoneCount * 3) +
+                       estimateStackWorkingBytes(paddedWidthStructure, paddedHeightStructure, zoneCount * 3) +
+                       static_cast<std::uint64_t>(pixelCount) * static_cast<std::uint64_t>(zoneCount) * sizeof(float) * 9ULL;
+            }
+            const int binCount = std::min<int>(static_cast<int>(fieldPlan.zones.front()->bins.size()), kLensDiffMaxSpectralBins);
+            int maxCoreKernel = 1;
+            int maxStructureKernel = 1;
+            for (const LensDiffFieldZoneCache* zone : fieldPlan.zones) {
+                for (int binIndex = 0; binIndex < binCount; ++binIndex) {
+                    maxCoreKernel = std::max(maxCoreKernel, kernelForEffect(zone->bins[static_cast<std::size_t>(binIndex)], FieldEffectKind::Core).size);
+                    maxStructureKernel = std::max(maxStructureKernel, kernelForEffect(zone->bins[static_cast<std::size_t>(binIndex)], FieldEffectKind::Structure).size);
+                }
+            }
+            const int paddedWidthCore = nextPowerOfTwo(width + maxCoreKernel - 1);
+            const int paddedHeightCore = nextPowerOfTwo(height + maxCoreKernel - 1);
+            const int paddedWidthStructure = nextPowerOfTwo(width + maxStructureKernel - 1);
+            const int paddedHeightStructure = nextPowerOfTwo(height + maxStructureKernel - 1);
+            return estimateStackWorkingBytes(paddedWidthCore, paddedHeightCore, zoneCount * binCount) +
+                   estimateStackWorkingBytes(paddedWidthStructure, paddedHeightStructure, zoneCount * binCount) +
+                   static_cast<std::uint64_t>(pixelCount) * static_cast<std::uint64_t>(zoneCount) * sizeof(float) * 9ULL;
+        }
+        if (params.spectralMode == LensDiffSpectralMode::Mono) {
+            int maxKernelSize = 1;
+            for (const LensDiffFieldZoneCache* zone : fieldPlan.zones) {
+                maxKernelSize = std::max(maxKernelSize, kernelForEffect(zone->bins.front(), FieldEffectKind::Full).size);
+            }
+            const int paddedWidth = nextPowerOfTwo(width + maxKernelSize - 1);
+            const int paddedHeight = nextPowerOfTwo(height + maxKernelSize - 1);
+            return estimateStackWorkingBytes(paddedWidth, paddedHeight, zoneCount * 3) +
+                   static_cast<std::uint64_t>(pixelCount) * static_cast<std::uint64_t>(zoneCount) * sizeof(float) * 3ULL;
+        }
+        const int binCount = std::min<int>(static_cast<int>(fieldPlan.zones.front()->bins.size()), kLensDiffMaxSpectralBins);
+        int maxKernelSize = 1;
+        for (const LensDiffFieldZoneCache* zone : fieldPlan.zones) {
+            for (int binIndex = 0; binIndex < binCount; ++binIndex) {
+                maxKernelSize = std::max(maxKernelSize,
+                                         kernelForEffect(zone->bins[static_cast<std::size_t>(binIndex)], FieldEffectKind::Full).size);
+            }
+        }
+        const int paddedWidth = nextPowerOfTwo(width + maxKernelSize - 1);
+        const int paddedHeight = nextPowerOfTwo(height + maxKernelSize - 1);
+        return estimateStackWorkingBytes(paddedWidth, paddedHeight, zoneCount * binCount);
+    };
+    const std::uint64_t estimatedFieldStackBytes = estimateStackedFieldBytes();
+    const bool preferTiledSpectralField =
+        stackedFieldEnabled &&
+        LensDiffCudaExperimentalTiledFieldEnabled() &&
+        fieldPlan.canonical3x3 &&
+        !splitMode &&
+        params.spectralMode != LensDiffSpectralMode::Mono &&
+        estimatedFieldStackBytes > kFieldStackBudgetBytes;
+    const bool preferLegacySizedFieldExecution =
+        stackedFieldEnabled &&
+        fieldPlan.canonical3x3 &&
+        !preferTiledSpectralField &&
+        estimatedFieldStackBytes > kFieldStackBudgetBytes;
+    timing.fieldScratchEstimateBytes = estimatedFieldStackBytes;
+
+    PlaneSet effect;
+    PlaneSet coreEffect;
+    PlaneSet structureEffect;
+    const bool shouldRunFieldValidation =
+        validateField && !cache.fieldZones.empty() && !legacyPipeline;
+    if (cache.fieldZones.empty()) {
+        timing.fieldBranch = "global";
+        const bool useStableGlobalSplitPath = splitMode;
+        if (!(useStableGlobalSplitPath
+                  ? renderFromBinsStable(cache.bins,
+                                         effect,
+                                         needCore ? &coreEffect : nullptr,
+                                         needStructure ? &structureEffect : nullptr)
+                  : renderFromBins(cache.bins,
+                                   effect,
+                                   needCore ? &coreEffect : nullptr,
+                                   needStructure ? &structureEffect : nullptr))) {
+            return false;
+        }
+    } else if (stackedFieldEnabled && fieldPlan.canonical3x3 && splitMode && !preferLegacySizedFieldExecution) {
+        timing.fieldBranch = "stacked-split";
+        const auto fieldZonesStart = std::chrono::steady_clock::now();
+        timing.fieldZoneBatchDepth = std::max(timing.fieldZoneBatchDepth, static_cast<int>(fieldPlan.zones.size()));
+        if (!renderFieldZonesStackedSplit(&effect, needCore ? &coreEffect : nullptr, needStructure ? &structureEffect : nullptr)) {
+            return false;
+        }
+        timing.fieldZonesMs += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                                    std::chrono::steady_clock::now() - fieldZonesStart)
+                                    .count();
+    } else if (preferTiledSpectralField) {
+        timing.fieldBranch = "tiled-spectral";
+        const auto fieldZonesStart = std::chrono::steady_clock::now();
+        if (!renderFieldZonesSpectralTiled(FieldEffectKind::Full, &effect) ||
+            (needCore && !renderFieldZonesSpectralTiled(FieldEffectKind::Core, &coreEffect)) ||
+            (needStructure && !renderFieldZonesSpectralTiled(FieldEffectKind::Structure, &structureEffect))) {
+            return false;
+        }
+        if (tiledFieldWorkingBytes > 0) {
+            timing.fieldScratchEstimateBytes = tiledFieldWorkingBytes;
+        }
+        timing.fieldZonesMs += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                                    std::chrono::steady_clock::now() - fieldZonesStart)
+                                    .count();
+    } else if (stackedFieldEnabled && fieldPlan.canonical3x3 && params.spectralMode == LensDiffSpectralMode::Mono && !preferLegacySizedFieldExecution) {
+        timing.fieldBranch = "stacked-mono";
+        const auto fieldZonesStart = std::chrono::steady_clock::now();
+        timing.fieldZoneBatchDepth = std::max(timing.fieldZoneBatchDepth, static_cast<int>(fieldPlan.zones.size()));
+        if (!renderFieldZonesStackedMono(FieldEffectKind::Full, &effect) ||
+            (needCore && !renderFieldZonesStackedMono(FieldEffectKind::Core, &coreEffect)) ||
+            (needStructure && !renderFieldZonesStackedMono(FieldEffectKind::Structure, &structureEffect))) {
+            return false;
+        }
+        timing.fieldZonesMs += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                                    std::chrono::steady_clock::now() - fieldZonesStart)
+                                    .count();
+    } else if (stackedFieldEnabled && fieldPlan.canonical3x3 && !preferLegacySizedFieldExecution) {
+        timing.fieldBranch = "stacked-spectral";
+        const auto fieldZonesStart = std::chrono::steady_clock::now();
+        timing.fieldZoneBatchDepth = std::max(timing.fieldZoneBatchDepth, static_cast<int>(fieldPlan.zones.size()));
+        if (!renderFieldZonesStackedSpectral(FieldEffectKind::Full, &effect) ||
+            (needCore && !renderFieldZonesStackedSpectral(FieldEffectKind::Core, &coreEffect)) ||
+            (needStructure && !renderFieldZonesStackedSpectral(FieldEffectKind::Structure, &structureEffect))) {
+            return false;
+        }
+        timing.fieldZonesMs += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                                    std::chrono::steady_clock::now() - fieldZonesStart)
+                                    .count();
+    } else {
+        timing.fieldBranch = "legacy";
+        const auto fieldZonesStart = std::chrono::steady_clock::now();
+        timing.fieldZoneBatchDepth = std::max(timing.fieldZoneBatchDepth, static_cast<int>(cache.fieldZones.size()));
+        if (!renderFieldZonesLegacy(&effect, needCore ? &coreEffect : nullptr, needStructure ? &structureEffect : nullptr)) {
+            return false;
+        }
+        timing.fieldZonesMs += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                                   std::chrono::steady_clock::now() - fieldZonesStart)
+                                   .count();
+    }
+    if (shouldRunFieldValidation && timing.fieldBranch != "legacy" && timing.fieldBranch != "global") {
+        PlaneSet legacyEffect;
+        PlaneSet legacyCore;
+        PlaneSet legacyStructure;
+        const auto validationStart = std::chrono::steady_clock::now();
+        timing.validationReferenceLegacy = true;
+        if (!renderFieldZonesLegacy(&legacyEffect, needCore ? &legacyCore : nullptr, needStructure ? &legacyStructure : nullptr) ||
+            !comparePlaneSets(effect, legacyEffect, &timing.validationEffectMaxAbs, "effect") ||
+            (needCore && !comparePlaneSets(coreEffect, legacyCore, &timing.validationCoreMaxAbs, "core")) ||
+            (needStructure && !comparePlaneSets(structureEffect, legacyStructure, &timing.validationStructureMaxAbs, "structure"))) {
+            return false;
+        }
+        timing.validationRan = true;
+        timing.validationMs += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                                   std::chrono::steady_clock::now() - validationStart)
+                                   .count();
     }
 
     if (params.energyMode == LensDiffEnergyMode::Preserve) {
-        float inputEnergy = 0.0f;
-        float effectEnergy = 0.0f;
-        if (!computeEnergySum(redistributedR, redistributedG, redistributedB, pixelCount, stream, &inputEnergy, error) ||
-            !computeEnergySum(effect.r, effect.g, effect.b, pixelCount, stream, &effectEnergy, error)) {
+        DeviceBuffer<float> inputEnergy;
+        DeviceBuffer<float> effectEnergy;
+        DeviceBuffer<float> preserveScale;
+        if (!inputEnergy.allocate(1) || !effectEnergy.allocate(1) || !preserveScale.allocate(1)) {
+            if (error) *error = "cuda-alloc-preserve-energy";
             return false;
         }
-        if (effectEnergy > 1e-6f) {
-            const float scale = inputEnergy / effectEnergy;
-            scaleRgbKernel<<<flatGrid, flatBlock, 0, stream>>>(effect.r.ptr, effect.g.ptr, effect.b.ptr, pixelCount, scale);
-            if (!checkCuda(cudaGetLastError(), "scaleRgbKernel-effect-preserve", error)) {
-                return false;
-            }
+        if (!checkCuda(cudaMemsetAsync(inputEnergy.ptr, 0, sizeof(float), stream), "cudaMemsetAsync-input-energy", error) ||
+            !checkCuda(cudaMemsetAsync(effectEnergy.ptr, 0, sizeof(float), stream), "cudaMemsetAsync-effect-energy", error)) {
+            return false;
+        }
+        lumaReduceKernel<<<flatGrid, flatBlock, 0, stream>>>(redistributedR.ptr, redistributedG.ptr, redistributedB.ptr, pixelCount, inputEnergy.ptr);
+        lumaReduceKernel<<<flatGrid, flatBlock, 0, stream>>>(effect.r.ptr, effect.g.ptr, effect.b.ptr, pixelCount, effectEnergy.ptr);
+        if (!checkCuda(cudaGetLastError(), "lumaReduceKernel-preserve", error)) {
+            return false;
+        }
+        computePreserveScaleKernelCuda<<<1, 1, 0, stream>>>(inputEnergy.ptr, effectEnergy.ptr, 1e-6f, preserveScale.ptr);
+        if (!checkCuda(cudaGetLastError(), "computePreserveScaleKernelCuda", error)) {
+            return false;
+        }
+        scaleRgbByScalarKernel<<<flatGrid, flatBlock, 0, stream>>>(effect.r.ptr, effect.g.ptr, effect.b.ptr, pixelCount, preserveScale.ptr);
+        if (!checkCuda(cudaGetLastError(), "scaleRgbByScalarKernel-preserve", error)) {
+            return false;
         }
     }
 
@@ -3029,26 +6653,31 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
     const double scatterRadiusPx = ResolveLensDiffScatterRadiusPx(params);
     const bool scatterActive = params.scatterAmount > 1e-6 && scatterRadiusPx > 0.25;
     if (scatterActive || params.debugView == LensDiffDebugView::Scatter) {
-        if (!allocatePlaneSet(scatterPreview)) {
-            if (error) *error = "cuda-alloc-scatter-preview";
-            return false;
-        }
-        if (scatterActive) {
-            const LensDiffKernel scatterKernel = buildGaussianKernelHost(static_cast<float>(scatterRadiusPx));
-            if (!convolvePlaneSet(effect.r, effect.g, effect.b, scatterKernel, scatterPreview, "cuda-convolve-scatter")) {
-                return false;
-            }
-            combineRgbKernel<<<flatGrid, flatBlock, 0, stream>>>(
-                effect.r.ptr, effect.g.ptr, effect.b.ptr,
-                scatterPreview.r.ptr, scatterPreview.g.ptr, scatterPreview.b.ptr,
-                pixelCount,
-                1.0f,
-                static_cast<float>(std::max(0.0, params.scatterAmount)),
-                effect.r.ptr, effect.g.ptr, effect.b.ptr);
-            if (!checkCuda(cudaGetLastError(), "combineRgbKernel-scatter", error)) {
-                return false;
-            }
-        } else if (!clearPlaneSet(scatterPreview, "cudaMemsetAsync-scatter-preview")) {
+        if (!timeCall(timing.scatterMs, [&] {
+                if (!allocatePlaneSet(scatterPreview)) {
+                    if (error) *error = "cuda-alloc-scatter-preview";
+                    return false;
+                }
+                if (scatterActive) {
+                    const LensDiffKernel scatterKernel = buildGaussianKernelHost(static_cast<float>(scatterRadiusPx));
+                    if (!convolvePlaneSet(effect.r, effect.g, effect.b, scatterKernel, scatterPreview, "cuda-convolve-scatter")) {
+                        return false;
+                    }
+                    combineRgbKernel<<<flatGrid, flatBlock, 0, stream>>>(
+                        effect.r.ptr, effect.g.ptr, effect.b.ptr,
+                        scatterPreview.r.ptr, scatterPreview.g.ptr, scatterPreview.b.ptr,
+                        pixelCount,
+                        1.0f,
+                        static_cast<float>(std::max(0.0, params.scatterAmount)),
+                        effect.r.ptr, effect.g.ptr, effect.b.ptr);
+                    if (!checkCuda(cudaGetLastError(), "combineRgbKernel-scatter", error)) {
+                        return false;
+                    }
+                } else if (!clearPlaneSet(scatterPreview, "cudaMemsetAsync-scatter-preview")) {
+                    return false;
+                }
+                return true;
+            })) {
             return false;
         }
     }
@@ -3057,24 +6686,29 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
     const double creativeFringePx = ResolveLensDiffCreativeFringePx(params);
     const bool creativeFringeActive = creativeFringePx > 1e-6;
     if (creativeFringeActive || params.debugView == LensDiffDebugView::CreativeFringe) {
-        PlaneSet fringedEffect;
-        if (!allocatePlaneSet(fringedEffect) ||
-            !allocatePlaneSet(creativeFringePreview)) {
-            if (error) *error = "cuda-alloc-creative-fringe";
-            return false;
-        }
-        if (creativeFringeActive) {
-            applyCreativeFringeKernel<<<grid2d, block2d, 0, stream>>>(
-                effect.r.ptr, effect.g.ptr, effect.b.ptr,
-                width, height,
-                static_cast<float>(std::max(0.0, creativeFringePx)),
-                fringedEffect.r.ptr, fringedEffect.g.ptr, fringedEffect.b.ptr,
-                creativeFringePreview.r.ptr, creativeFringePreview.g.ptr, creativeFringePreview.b.ptr);
-            if (!checkCuda(cudaGetLastError(), "applyCreativeFringeKernel", error) ||
-                !copyPlaneSet(fringedEffect, effect, "cudaMemcpyAsync-fringed-effect")) {
-                return false;
-            }
-        } else if (!clearPlaneSet(creativeFringePreview, "cudaMemsetAsync-creative-preview")) {
+        if (!timeCall(timing.creativeFringeMs, [&] {
+                PlaneSet fringedEffect;
+                if (!allocatePlaneSet(fringedEffect) ||
+                    !allocatePlaneSet(creativeFringePreview)) {
+                    if (error) *error = "cuda-alloc-creative-fringe";
+                    return false;
+                }
+                if (creativeFringeActive) {
+                    applyCreativeFringeKernel<<<grid2d, block2d, 0, stream>>>(
+                        effect.r.ptr, effect.g.ptr, effect.b.ptr,
+                        width, height,
+                        static_cast<float>(std::max(0.0, creativeFringePx)),
+                        fringedEffect.r.ptr, fringedEffect.g.ptr, fringedEffect.b.ptr,
+                        creativeFringePreview.r.ptr, creativeFringePreview.g.ptr, creativeFringePreview.b.ptr);
+                    if (!checkCuda(cudaGetLastError(), "applyCreativeFringeKernel", error) ||
+                        !copyPlaneSet(fringedEffect, effect, "cudaMemcpyAsync-fringed-effect")) {
+                        return false;
+                    }
+                } else if (!clearPlaneSet(creativeFringePreview, "cudaMemsetAsync-creative-preview")) {
+                    return false;
+                }
+                return true;
+            })) {
             return false;
         }
     }
@@ -3092,124 +6726,136 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         ? (1.0f - protectedCoreFraction) / redistributionScale
         : 0.0f;
 
-    if (params.debugView == LensDiffDebugView::Core) {
-        if (resolutionAwareActive) {
-            PlaneSet display;
-            if (!resamplePlaneSetToNative(coreEffect, display, "cuda-resample-core-display")) {
-                return false;
+    if (!timeCall(timing.compositeMs, [&] {
+            if (params.debugView == LensDiffDebugView::Core) {
+                if (resolutionAwareActive) {
+                    PlaneSet display;
+                    if (!timeCall(timing.nativeResampleMs, [&] {
+                            return resamplePlaneSetToNative(coreEffect, display, "cuda-resample-core-display");
+                        })) {
+                        return false;
+                    }
+                    packRgbDebugKernel<<<nativeFlatGrid, flatBlock, 0, stream>>>(display.r.ptr, display.g.ptr, display.b.ptr, nullptr, nativePixelCount, 1.0f, packedOutput.ptr);
+                } else {
+                    packRgbDebugKernel<<<flatGrid, flatBlock, 0, stream>>>(coreEffect.r.ptr, coreEffect.g.ptr, coreEffect.b.ptr, nullptr, pixelCount, 1.0f, packedOutput.ptr);
+                }
+                return checkCuda(cudaGetLastError(), "packRgbDebugKernel-core", error);
+            } else if (params.debugView == LensDiffDebugView::Structure) {
+                if (resolutionAwareActive) {
+                    PlaneSet display;
+                    if (!timeCall(timing.nativeResampleMs, [&] {
+                            return resamplePlaneSetToNative(structureEffect, display, "cuda-resample-structure-display");
+                        })) {
+                        return false;
+                    }
+                    packRgbDebugKernel<<<nativeFlatGrid, flatBlock, 0, stream>>>(display.r.ptr, display.g.ptr, display.b.ptr, nullptr, nativePixelCount, 1.0f, packedOutput.ptr);
+                } else {
+                    packRgbDebugKernel<<<flatGrid, flatBlock, 0, stream>>>(structureEffect.r.ptr, structureEffect.g.ptr, structureEffect.b.ptr, nullptr, pixelCount, 1.0f, packedOutput.ptr);
+                }
+                return checkCuda(cudaGetLastError(), "packRgbDebugKernel-structure", error);
+            } else if (params.debugView == LensDiffDebugView::Effect) {
+                if (resolutionAwareActive) {
+                    PlaneSet display;
+                    if (!timeCall(timing.nativeResampleMs, [&] {
+                            return resamplePlaneSetToNative(effect, display, "cuda-resample-effect-display");
+                        })) {
+                        return false;
+                    }
+                    packRgbDebugKernel<<<nativeFlatGrid, flatBlock, 0, stream>>>(display.r.ptr, display.g.ptr, display.b.ptr, nullptr, nativePixelCount, 1.0f, packedOutput.ptr);
+                } else {
+                    packRgbDebugKernel<<<flatGrid, flatBlock, 0, stream>>>(effect.r.ptr, effect.g.ptr, effect.b.ptr, nullptr, pixelCount, 1.0f, packedOutput.ptr);
+                }
+                return checkCuda(cudaGetLastError(), "packRgbDebugKernel-effect", error);
+            } else if (params.debugView == LensDiffDebugView::Scatter) {
+                if (resolutionAwareActive) {
+                    PlaneSet display;
+                    if (!timeCall(timing.nativeResampleMs, [&] {
+                            return resamplePlaneSetToNative(scatterPreview, display, "cuda-resample-scatter-display");
+                        })) {
+                        return false;
+                    }
+                    packRgbDebugKernel<<<nativeFlatGrid, flatBlock, 0, stream>>>(display.r.ptr, display.g.ptr, display.b.ptr, nullptr, nativePixelCount, 1.0f, packedOutput.ptr);
+                } else {
+                    packRgbDebugKernel<<<flatGrid, flatBlock, 0, stream>>>(scatterPreview.r.ptr, scatterPreview.g.ptr, scatterPreview.b.ptr, nullptr, pixelCount, 1.0f, packedOutput.ptr);
+                }
+                return checkCuda(cudaGetLastError(), "packRgbDebugKernel-scatter", error);
+            } else if (params.debugView == LensDiffDebugView::CreativeFringe) {
+                if (resolutionAwareActive) {
+                    PlaneSet display;
+                    if (!timeCall(timing.nativeResampleMs, [&] {
+                            return resamplePlaneSetToNative(creativeFringePreview, display, "cuda-resample-creative-display");
+                        })) {
+                        return false;
+                    }
+                    packRgbDebugKernel<<<nativeFlatGrid, flatBlock, 0, stream>>>(display.r.ptr, display.g.ptr, display.b.ptr, nullptr, nativePixelCount, 1.0f, packedOutput.ptr);
+                } else {
+                    packRgbDebugKernel<<<flatGrid, flatBlock, 0, stream>>>(creativeFringePreview.r.ptr, creativeFringePreview.g.ptr, creativeFringePreview.b.ptr, nullptr, pixelCount, 1.0f, packedOutput.ptr);
+                }
+                return checkCuda(cudaGetLastError(), "packRgbDebugKernel-creative-fringe", error);
             }
-            packRgbDebugKernel<<<nativeFlatGrid, flatBlock, 0, stream>>>(display.r.ptr, display.g.ptr, display.b.ptr, nullptr, nativePixelCount, 1.0f, packedOutput.ptr);
-        } else {
-            packRgbDebugKernel<<<flatGrid, flatBlock, 0, stream>>>(coreEffect.r.ptr, coreEffect.g.ptr, coreEffect.b.ptr, nullptr, pixelCount, 1.0f, packedOutput.ptr);
-        }
-        if (!checkCuda(cudaGetLastError(), "packRgbDebugKernel-core", error)) {
-            return false;
-        }
-    } else if (params.debugView == LensDiffDebugView::Structure) {
-        if (resolutionAwareActive) {
-            PlaneSet display;
-            if (!resamplePlaneSetToNative(structureEffect, display, "cuda-resample-structure-display")) {
-                return false;
+
+            DeviceBuffer<float> redistributedRDisplay;
+            DeviceBuffer<float> redistributedGDisplay;
+            DeviceBuffer<float> redistributedBDisplay;
+            DeviceBuffer<float> effectRDisplay;
+            DeviceBuffer<float> effectGDisplay;
+            DeviceBuffer<float> effectBDisplay;
+            const DeviceBuffer<float>* compositeRedistR = &redistributedR;
+            const DeviceBuffer<float>* compositeRedistG = &redistributedG;
+            const DeviceBuffer<float>* compositeRedistB = &redistributedB;
+            const DeviceBuffer<float>* compositeEffectR = &effect.r;
+            const DeviceBuffer<float>* compositeEffectG = &effect.g;
+            const DeviceBuffer<float>* compositeEffectB = &effect.b;
+            std::size_t compositeCount = pixelCount;
+            int compositeFlatGrid = flatGrid;
+            if (resolutionAwareActive) {
+                if (!timeCall(timing.nativeResampleMs, [&] {
+                        return resamplePlaneToNative(redistributedR, redistributedRDisplay, "cuda-resample-redistributed-r") &&
+                               resamplePlaneToNative(redistributedG, redistributedGDisplay, "cuda-resample-redistributed-g") &&
+                               resamplePlaneToNative(redistributedB, redistributedBDisplay, "cuda-resample-redistributed-b") &&
+                               resamplePlaneToNative(effect.r, effectRDisplay, "cuda-resample-effect-r") &&
+                               resamplePlaneToNative(effect.g, effectGDisplay, "cuda-resample-effect-g") &&
+                               resamplePlaneToNative(effect.b, effectBDisplay, "cuda-resample-effect-b");
+                    })) {
+                    return false;
+                }
+                compositeRedistR = &redistributedRDisplay;
+                compositeRedistG = &redistributedGDisplay;
+                compositeRedistB = &redistributedBDisplay;
+                compositeEffectR = &effectRDisplay;
+                compositeEffectG = &effectGDisplay;
+                compositeEffectB = &effectBDisplay;
+                compositeCount = nativePixelCount;
+                compositeFlatGrid = nativeFlatGrid;
             }
-            packRgbDebugKernel<<<nativeFlatGrid, flatBlock, 0, stream>>>(display.r.ptr, display.g.ptr, display.b.ptr, nullptr, nativePixelCount, 1.0f, packedOutput.ptr);
-        } else {
-            packRgbDebugKernel<<<flatGrid, flatBlock, 0, stream>>>(structureEffect.r.ptr, structureEffect.g.ptr, structureEffect.b.ptr, nullptr, pixelCount, 1.0f, packedOutput.ptr);
-        }
-        if (!checkCuda(cudaGetLastError(), "packRgbDebugKernel-structure", error)) {
-            return false;
-        }
-    } else if (params.debugView == LensDiffDebugView::Effect) {
-        if (resolutionAwareActive) {
-            PlaneSet display;
-            if (!resamplePlaneSetToNative(effect, display, "cuda-resample-effect-display")) {
-                return false;
-            }
-            packRgbDebugKernel<<<nativeFlatGrid, flatBlock, 0, stream>>>(display.r.ptr, display.g.ptr, display.b.ptr, nullptr, nativePixelCount, 1.0f, packedOutput.ptr);
-        } else {
-            packRgbDebugKernel<<<flatGrid, flatBlock, 0, stream>>>(effect.r.ptr, effect.g.ptr, effect.b.ptr, nullptr, pixelCount, 1.0f, packedOutput.ptr);
-        }
-        if (!checkCuda(cudaGetLastError(), "packRgbDebugKernel-effect", error)) {
-            return false;
-        }
-    } else if (params.debugView == LensDiffDebugView::Scatter) {
-        if (resolutionAwareActive) {
-            PlaneSet display;
-            if (!resamplePlaneSetToNative(scatterPreview, display, "cuda-resample-scatter-display")) {
-                return false;
-            }
-            packRgbDebugKernel<<<nativeFlatGrid, flatBlock, 0, stream>>>(display.r.ptr, display.g.ptr, display.b.ptr, nullptr, nativePixelCount, 1.0f, packedOutput.ptr);
-        } else {
-            packRgbDebugKernel<<<flatGrid, flatBlock, 0, stream>>>(scatterPreview.r.ptr, scatterPreview.g.ptr, scatterPreview.b.ptr, nullptr, pixelCount, 1.0f, packedOutput.ptr);
-        }
-        if (!checkCuda(cudaGetLastError(), "packRgbDebugKernel-scatter", error)) {
-            return false;
-        }
-    } else if (params.debugView == LensDiffDebugView::CreativeFringe) {
-        if (resolutionAwareActive) {
-            PlaneSet display;
-            if (!resamplePlaneSetToNative(creativeFringePreview, display, "cuda-resample-creative-display")) {
-                return false;
-            }
-            packRgbDebugKernel<<<nativeFlatGrid, flatBlock, 0, stream>>>(display.r.ptr, display.g.ptr, display.b.ptr, nullptr, nativePixelCount, 1.0f, packedOutput.ptr);
-        } else {
-            packRgbDebugKernel<<<flatGrid, flatBlock, 0, stream>>>(creativeFringePreview.r.ptr, creativeFringePreview.g.ptr, creativeFringePreview.b.ptr, nullptr, pixelCount, 1.0f, packedOutput.ptr);
-        }
-        if (!checkCuda(cudaGetLastError(), "packRgbDebugKernel-creative-fringe", error)) {
-            return false;
-        }
-    } else {
-        DeviceBuffer<float> redistributedRDisplay;
-        DeviceBuffer<float> redistributedGDisplay;
-        DeviceBuffer<float> redistributedBDisplay;
-        DeviceBuffer<float> effectRDisplay;
-        DeviceBuffer<float> effectGDisplay;
-        DeviceBuffer<float> effectBDisplay;
-        const DeviceBuffer<float>* compositeRedistR = &redistributedR;
-        const DeviceBuffer<float>* compositeRedistG = &redistributedG;
-        const DeviceBuffer<float>* compositeRedistB = &redistributedB;
-        const DeviceBuffer<float>* compositeEffectR = &effect.r;
-        const DeviceBuffer<float>* compositeEffectG = &effect.g;
-        const DeviceBuffer<float>* compositeEffectB = &effect.b;
-        std::size_t compositeCount = pixelCount;
-        int compositeFlatGrid = flatGrid;
-        if (resolutionAwareActive) {
-            if (!resamplePlaneToNative(redistributedR, redistributedRDisplay, "cuda-resample-redistributed-r") ||
-                !resamplePlaneToNative(redistributedG, redistributedGDisplay, "cuda-resample-redistributed-g") ||
-                !resamplePlaneToNative(redistributedB, redistributedBDisplay, "cuda-resample-redistributed-b") ||
-                !resamplePlaneToNative(effect.r, effectRDisplay, "cuda-resample-effect-r") ||
-                !resamplePlaneToNative(effect.g, effectGDisplay, "cuda-resample-effect-g") ||
-                !resamplePlaneToNative(effect.b, effectBDisplay, "cuda-resample-effect-b")) {
-                return false;
-            }
-            compositeRedistR = &redistributedRDisplay;
-            compositeRedistG = &redistributedGDisplay;
-            compositeRedistB = &redistributedBDisplay;
-            compositeEffectR = &effectRDisplay;
-            compositeEffectG = &effectGDisplay;
-            compositeEffectB = &effectBDisplay;
-            compositeCount = nativePixelCount;
-            compositeFlatGrid = nativeFlatGrid;
-        }
-        compositeFinalKernel<<<compositeFlatGrid, flatBlock, 0, stream>>>(nativeSrcR.ptr,
-                                                                           nativeSrcG.ptr,
-                                                                           nativeSrcB.ptr,
-                                                                           nativeSrcA.ptr,
-                                                                           compositeRedistR->ptr,
-                                                                           compositeRedistG->ptr,
-                                                                           compositeRedistB->ptr,
-                                                                           compositeEffectR->ptr,
-                                                                           compositeEffectG->ptr,
-                                                                           compositeEffectB->ptr,
-                                                                           compositeCount,
-                                                                           coreCompensation,
-                                                                           effectGain,
-                                                                           maxRedistributedSubtractScale,
-                                                                           inputTransfer,
-                                                                           packedOutput.ptr);
-        if (!checkCuda(cudaGetLastError(), "compositeFinalKernel", error)) {
-            return false;
-        }
+            compositeFinalKernel<<<compositeFlatGrid, flatBlock, 0, stream>>>(nativeSrcR.ptr,
+                                                                               nativeSrcG.ptr,
+                                                                               nativeSrcB.ptr,
+                                                                               nativeSrcA.ptr,
+                                                                               compositeRedistR->ptr,
+                                                                               compositeRedistG->ptr,
+                                                                               compositeRedistB->ptr,
+                                                                               compositeEffectR->ptr,
+                                                                               compositeEffectG->ptr,
+                                                                               compositeEffectB->ptr,
+                                                                               compositeCount,
+                                                                               coreCompensation,
+                                                                               effectGain,
+                                                                               maxRedistributedSubtractScale,
+                                                                               inputTransfer,
+                                                                               packedOutput.ptr);
+            return checkCuda(cudaGetLastError(), "compositeFinalKernel", error);
+        })) {
+        return false;
     }
 
-    return copyPackedToDestination(request, packedOutput.ptr, nativeWidth, nativeHeight, stream, cudaMemcpyDeviceToDevice, error);
+    bool copyOk = false;
+    if (!timeCall(timing.outputCopyMs, [&] {
+            copyOk = copyPackedToDestination(request, packedOutput.ptr, nativeWidth, nativeHeight, stream, cudaMemcpyDeviceToDevice, error);
+            return copyOk;
+        })) {
+        return false;
+    }
+    logTimingBreakdown();
+    return copyOk;
 }

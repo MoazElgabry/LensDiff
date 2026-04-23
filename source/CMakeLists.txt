@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(LensDiff VERSION 0.2.3 LANGUAGES CXX)
+project(LensDiff VERSION 0.2.4 LANGUAGES CXX)
 
 set(PLUGIN_BASENAME "LensDiff")
-set(CUBE_DISPLAY_VERSION "0.2.3")
+set(CUBE_DISPLAY_VERSION "0.2.4")
 set(PLUGIN_IDENTIFIER "com.moazelgabry.LensDiff")
 set(LOCAL_OFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk")
 set(GENERATED_ASSET_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -114,6 +114,7 @@ add_library(${PLUGIN_BASENAME} SHARED
   $<$<BOOL:${LENSDIFF_HAS_CUDA}>:src/cuda/LensDiffCuda.cu>
   $<$<PLATFORM_ID:Darwin>:src/core/LensDiffFileDialog.mm>
   $<$<PLATFORM_ID:Darwin>:src/metal/LensDiffMetal.mm>
+  $<$<PLATFORM_ID:Darwin>:src/metal/LensDiffMetalVkFFT.mm>
   ${OFX_SUPPORT_SOURCES}
 )
 
@@ -153,9 +154,17 @@ if(WIN32)
 endif()
 
 if(APPLE)
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/VkFFT/vkFFT/vkFFT.h")
+    message(FATAL_ERROR "Missing vendored VkFFT at ${CMAKE_CURRENT_SOURCE_DIR}/external/VkFFT.")
+  endif()
+  target_include_directories(${PLUGIN_BASENAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/VkFFT/vkFFT
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/VkFFT/metal-cpp)
+  target_compile_definitions(${PLUGIN_BASENAME} PRIVATE VKFFT_BACKEND=5)
   target_link_libraries(${PLUGIN_BASENAME} PRIVATE
     "-framework Foundation"
     "-framework Metal"
+    "-framework QuartzCore"
     "-framework AppKit"
     "-framework ApplicationServices"
     "-framework ImageIO")

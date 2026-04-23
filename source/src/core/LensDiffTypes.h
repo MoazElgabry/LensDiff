@@ -112,6 +112,7 @@ struct LensDiffImageView {
 
 struct LensDiffRenderRequest {
     LensDiffImageRect renderWindow {};
+    LensDiffImageRect frameBounds {};
     LensDiffImageView src {};
     LensDiffImageView dst {};
     LensDiffBackendType requestedBackend = LensDiffBackendType::Auto;
