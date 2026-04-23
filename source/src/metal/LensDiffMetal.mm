@@ -744,6 +744,41 @@ struct PipelineBundle {
     id<MTLComputePipelineState> cropKernel = nil;
 };
 
+bool encodeSquareForwardFft(id<MTLCommandBuffer> commandBuffer,
+                            id<MTLComputeCommandEncoder> encoder,
+                            PipelineBundle* pipelines,
+                            id<MTLBuffer> spectrum,
+                            id<MTLBuffer> scratch,
+                            id<MTLBuffer> transpose,
+                            int size,
+                            std::string* error);
+bool encodeSquareInverseFft(id<MTLCommandBuffer> commandBuffer,
+                            id<MTLComputeCommandEncoder> encoder,
+                            PipelineBundle* pipelines,
+                            id<MTLBuffer> spectrum,
+                            id<MTLBuffer> scratch,
+                            id<MTLBuffer> transpose,
+                            int size,
+                            std::string* error);
+bool encodeSquareForwardFftStack(id<MTLCommandBuffer> commandBuffer,
+                                 id<MTLComputeCommandEncoder> encoder,
+                                 PipelineBundle* pipelines,
+                                 id<MTLBuffer> spectrum,
+                                 id<MTLBuffer> scratch,
+                                 id<MTLBuffer> transpose,
+                                 int size,
+                                 int imageCount,
+                                 std::string* error);
+bool encodeSquareInverseFftStack(id<MTLCommandBuffer> commandBuffer,
+                                 id<MTLComputeCommandEncoder> encoder,
+                                 PipelineBundle* pipelines,
+                                 id<MTLBuffer> spectrum,
+                                 id<MTLBuffer> scratch,
+                                 id<MTLBuffer> transpose,
+                                 int size,
+                                 int imageCount,
+                                 std::string* error);
+
 std::mutex gPipelineMutex;
 PipelineBundle gPipelines;
 std::mutex gWorkQueueMutex;
