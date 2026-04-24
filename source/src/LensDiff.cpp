@@ -54,8 +54,8 @@ constexpr const char* kPluginDescription =
 constexpr const char* kPluginIdentifier = "com.moazelgabry.LensDiff";
 constexpr int kPluginVersionMajor = 0;
 constexpr int kPluginVersionMinor = 2;
-constexpr const char* kPluginVersionLabel = "v0.2.4";
-constexpr const char* kPluginDisplayVersion = "0.2.4";
+constexpr const char* kPluginVersionLabel = "v0.2.5";
+constexpr const char* kPluginDisplayVersion = "0.2.5";
 constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
 
 constexpr bool kSupportsTiles = true;
@@ -3834,7 +3834,30 @@ void LensDiffEffect::render(const OFX::RenderArguments& args) {
 #ifdef __APPLE__
     if (!rendered && request.requestedBackend == LensDiffBackendType::Metal) {
         request.selectedBackend = LensDiffBackendType::Metal;
+        if (logEnabled) {
+            std::ostringstream metalDispatchNote;
+            metalDispatchNote << "renderWindow=(" << request.renderWindow.x1 << "," << request.renderWindow.y1 << ")-("
+                              << request.renderWindow.x2 << "," << request.renderWindow.y2 << ")"
+                              << " frameBounds=(" << request.frameBounds.x1 << "," << request.frameBounds.y1 << ")-("
+                              << request.frameBounds.x2 << "," << request.frameBounds.y2 << ")"
+                              << " srcBounds=(" << request.src.bounds.x1 << "," << request.src.bounds.y1 << ")-("
+                              << request.src.bounds.x2 << "," << request.src.bounds.y2 << ")"
+                              << " dstBounds=(" << request.dst.bounds.x1 << "," << request.dst.bounds.y1 << ")-("
+                              << request.dst.bounds.x2 << "," << request.dst.bounds.y2 << ")"
+                              << " resolutionAware=" << (params.resolutionAware ? "true" : "false")
+                              << " spectral=" << spectralModeName(params.spectralMode)
+                              << " debug=" << debugViewName(params.debugView);
+            LogLensDiffDiagnosticEvent("host-metal-dispatch", metalDispatchNote.str());
+        }
         rendered = RunLensDiffMetal(request, params, cache_, &error);
+        if (logEnabled) {
+            std::ostringstream metalReturnNote;
+            metalReturnNote << "rendered=" << (rendered ? "true" : "false");
+            if (!error.empty()) {
+                metalReturnNote << " error=" << error;
+            }
+            LogLensDiffDiagnosticEvent("host-metal-return", metalReturnNote.str());
+        }
         if (rendered) {
             executedBackend = LensDiffBackendType::Metal;
         }

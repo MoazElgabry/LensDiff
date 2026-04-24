@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -97,6 +98,21 @@ inline void WriteLensDiffDiagnosticLine(const std::string& line) {
     }
     stream << "[" << LensDiffNowUtcIso8601() << "] " << cleanLine << '\n';
     stream.flush();
+}
+
+inline void LogLensDiffDiagnosticEvent(const char* event, const std::string& note = std::string()) {
+    if (!LensDiffLogEnabled()) {
+        return;
+    }
+    std::ostringstream ss;
+    ss << "[LensDiffDiag] event=" << event;
+    if (!note.empty()) {
+        ss << " note=" << note;
+    }
+    std::string line = ss.str();
+    std::fprintf(stderr, "%s\n", line.c_str());
+    std::fflush(stderr);
+    WriteLensDiffDiagnosticLine(line);
 }
 
 inline void LogLensDiffTimingStage(const char* stage, double elapsedMs, const std::string& note = std::string()) {

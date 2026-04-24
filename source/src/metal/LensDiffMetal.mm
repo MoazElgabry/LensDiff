@@ -2819,12 +2819,8 @@ id<MTLBuffer> makeSharedBuffer(id<MTLDevice> device, NSUInteger length, std::str
         if (byteCount < kHeapThresholdBytes) {
             return nil;
         }
-        const char* disableHeaps = std::getenv("LENSDIFF_METAL_DISABLE_HEAPS");
-        if (disableHeaps != nullptr && *disableHeaps != '\0') {
-            const std::string text(disableHeaps);
-            if (text != "0" && text != "false" && text != "FALSE" && text != "off" && text != "OFF") {
-                return nil;
-            }
+        if (!LensDiffMetalHeapsEnabled()) {
+            return nil;
         }
         if (![device respondsToSelector:@selector(newHeapWithDescriptor:)]) {
             return nil;
@@ -2935,6 +2931,10 @@ bool commitAndWait(id<MTLCommandBuffer> commandBuffer, std::string* error) {
         if (error) {
             *error = "metal-command-buffer-failed:" + nsErrorString(commandBuffer.error);
         }
+        std::ostringstream note;
+        note << "status=" << static_cast<int>(commandBuffer.status)
+             << " error=" << nsErrorString(commandBuffer.error);
+        LogLensDiffDiagnosticEvent("metal-command-buffer-failed", note.str());
         return false;
     }
     return true;
@@ -2948,6 +2948,9 @@ bool lensDiffMetalEnvFlagEnabled(const char* name) {
     const std::string text(value);
     return text != "0" && text != "false" && text != "FALSE" && text != "off" && text != "OFF";
 }
+
+thread_local int gLensDiffMetalHeapsOverride = -1;
+thread_local int gLensDiffMetalVkFFTOverride = -1;
 
 bool LensDiffMetalLegacySyncEnabled() {
     return lensDiffMetalEnvFlagEnabled("LENSDIFF_METAL_LEGACY_SYNC");
@@ -2965,13 +2968,44 @@ bool LensDiffMetalFastResolutionAwareEnabled() {
     return lensDiffMetalEnvFlagEnabled("LENSDIFF_METAL_FAST_RESOLUTION_AWARE");
 }
 
-bool LensDiffMetalHeapsEnabled() {
+bool LensDiffMetalHeapsRequested() {
     return !lensDiffMetalEnvFlagEnabled("LENSDIFF_METAL_DISABLE_HEAPS");
 }
 
-bool LensDiffMetalVkFFTEnabled() {
+bool LensDiffMetalHeapsEnabled() {
+    if (gLensDiffMetalHeapsOverride >= 0) {
+        return gLensDiffMetalHeapsOverride != 0;
+    }
+    return LensDiffMetalHeapsRequested();
+}
+
+bool LensDiffMetalVkFFTRequested() {
     return !lensDiffMetalEnvFlagEnabled("LENSDIFF_METAL_DISABLE_VKFFT");
 }
+
+bool LensDiffMetalVkFFTEnabled() {
+    if (gLensDiffMetalVkFFTOverride >= 0) {
+        return gLensDiffMetalVkFFTOverride != 0;
+    }
+    return LensDiffMetalVkFFTRequested();
+}
+
+struct LensDiffMetalRuntimeOverrideScope {
+    int previousHeaps = -1;
+    int previousVkFFT = -1;
+
+    LensDiffMetalRuntimeOverrideScope(bool heapsEnabled, bool vkfftEnabled)
+        : previousHeaps(gLensDiffMetalHeapsOverride)
+        , previousVkFFT(gLensDiffMetalVkFFTOverride) {
+        gLensDiffMetalHeapsOverride = heapsEnabled ? 1 : 0;
+        gLensDiffMetalVkFFTOverride = vkfftEnabled ? 1 : 0;
+    }
+
+    ~LensDiffMetalRuntimeOverrideScope() {
+        gLensDiffMetalHeapsOverride = previousHeaps;
+        gLensDiffMetalVkFFTOverride = previousVkFFT;
+    }
+};
 
 struct MetalRenderTimingCounters {
     int commandBufferCount = 0;
@@ -5132,6 +5166,22 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
     }
 
     @autoreleasepool {
+    bool renderSucceeded = false;
+    struct MetalRenderScopeLogger {
+        bool* success = nullptr;
+        std::string* error = nullptr;
+
+        ~MetalRenderScopeLogger() {
+            std::ostringstream note;
+            note << "success=" << ((success != nullptr && *success) ? "true" : "false");
+            if (error != nullptr && !error->empty()) {
+                note << " error=" << *error;
+            }
+            LogLensDiffDiagnosticEvent("metal-render-exit", note.str());
+        }
+    } renderScope {&renderSucceeded, error};
+
+    LogLensDiffDiagnosticEvent("metal-render-enter");
     id<MTLCommandQueue> hostQueue = (__bridge id<MTLCommandQueue>)request.metalCommandQueue;
     id<MTLBuffer> srcBuffer = (__bridge id<MTLBuffer>)request.src.data;
     id<MTLBuffer> dstBuffer = (__bridge id<MTLBuffer>)request.dst.data;
@@ -5148,10 +5198,17 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
     if (queue == nil) {
         return false;
     }
+    {
+        std::ostringstream queueNote;
+        queueNote << "hostQueue=" << static_cast<const void*>(hostQueue)
+                  << " workQueue=" << static_cast<const void*>(queue);
+        LogLensDiffDiagnosticEvent("metal-queues-ready", queueNote.str());
+    }
     PipelineBundle* pipelines = ensurePipelines(device, error);
     if (pipelines == nullptr) {
         return false;
     }
+    LogLensDiffDiagnosticEvent("metal-pipelines-ready");
 
     struct MetalRenderTimingBreakdown {
         double psfBankMs = 0.0;
@@ -5213,10 +5270,6 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                 ",waits=" + std::to_string(timing.waitCount));
     };
 
-    if (!timeCall(timing.psfBankMs, [&] { return ensurePsfBankMetal(params, cache, device, queue, pipelines, error); })) {
-        return false;
-    }
-
     const int nativeWidth = request.src.bounds.width();
     const int nativeHeight = request.src.bounds.height();
     const NSUInteger nativePixelCount = static_cast<NSUInteger>(nativeWidth) * static_cast<NSUInteger>(nativeHeight);
@@ -5229,7 +5282,6 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
     const NSUInteger pixelCount = static_cast<NSUInteger>(width) * static_cast<NSUInteger>(height);
     const NSUInteger rgbaBytes = pixelCount * 4u * sizeof(float);
     const NSUInteger scalarBytes = pixelCount * sizeof(float);
-    const FieldZoneBatchPlan fieldPlan = buildFieldZoneBatchPlan(cache);
     const bool splitMode = params.lookMode == LensDiffLookMode::Split;
     const bool needCore = splitMode || params.debugView == LensDiffDebugView::Core;
     const bool needStructure = splitMode || params.debugView == LensDiffDebugView::Structure;
@@ -5237,20 +5289,32 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
     const bool allowFastField = LensDiffMetalFastFieldEnabled();
     const bool allowFastSplit = LensDiffMetalFastSplitEnabled();
     const bool allowFastResolutionAware = LensDiffMetalFastResolutionAwareEnabled();
+    const bool fieldRequested = HasLensDiffFieldPhase(params);
     // Mirror the stabilized CUDA rollout: keep the optimized GPU path as the default only for the
     // ordinary global physical render, and require explicit opt-in before using it for field,
     // split, or resolution-aware requests that are more sensitive to memory churn and parity drift.
     const bool fastPathAllowed =
         !requestedLegacySync &&
         (!resolutionAwareActive || allowFastResolutionAware) &&
-        ((cache.fieldZones.empty() && !splitMode) ||
-         (cache.fieldZones.empty() && splitMode && allowFastSplit) ||
-         (!cache.fieldZones.empty() && fieldPlan.canonical3x3 && allowFastField));
+        ((!fieldRequested && !splitMode) ||
+         (!fieldRequested && splitMode && allowFastSplit) ||
+         (fieldRequested && allowFastField));
     const bool legacySync = !fastPathAllowed;
+    const bool heapsRequested = LensDiffMetalHeapsRequested();
+    const bool vkfftRequested = LensDiffMetalVkFFTRequested();
+    const bool heapsEnabled = heapsRequested && !legacySync;
+    const bool vkfftEnabled = vkfftRequested && !legacySync;
+    LensDiffMetalRuntimeOverrideScope runtimeOverride(heapsEnabled, vkfftEnabled);
+    if (!timeCall(timing.psfBankMs, [&] { return ensurePsfBankMetal(params, cache, device, queue, pipelines, error); })) {
+        return false;
+    }
+    const FieldZoneBatchPlan fieldPlan = buildFieldZoneBatchPlan(cache);
     executionModeNote =
         "mode=" + std::string(legacySync ? "stable" : "fast") +
-        ",vkfft=" + std::to_string(LensDiffMetalVkFFTEnabled() ? 1 : 0) +
-        ",heaps=" + std::to_string(LensDiffMetalHeapsEnabled() ? 1 : 0) +
+        ",vkfftRequested=" + std::to_string(vkfftRequested ? 1 : 0) +
+        ",vkfftEffective=" + std::to_string(vkfftEnabled ? 1 : 0) +
+        ",heapsRequested=" + std::to_string(heapsRequested ? 1 : 0) +
+        ",heapsEffective=" + std::to_string(heapsEnabled ? 1 : 0) +
         ",requestedLegacy=" + std::to_string(requestedLegacySync ? 1 : 0) +
         ",field=" + std::to_string(cache.fieldZones.empty() ? 0 : 1) +
         ",canonical3x3=" + std::to_string(fieldPlan.canonical3x3 ? 1 : 0) +
@@ -5259,6 +5323,7 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
         ",fastField=" + std::to_string(allowFastField ? 1 : 0) +
         ",fastSplit=" + std::to_string(allowFastSplit ? 1 : 0) +
         ",fastResolutionAware=" + std::to_string(allowFastResolutionAware ? 1 : 0);
+    LogLensDiffDiagnosticEvent("metal-render-mode", executionModeNote);
     MetalScratchCache scratchCache {};
     MetalRenderTimingCounters renderCounters {};
     MetalRenderContext renderContext {device, queue, pipelines, &scratchCache, &renderCounters, error};
@@ -6705,6 +6770,14 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                                     .count();
     timing.commandBufferCount = renderCounters.commandBufferCount;
     timing.waitCount = renderCounters.waitCount;
+    renderSucceeded = outputOk;
+    if (outputOk) {
+        std::ostringstream outputNote;
+        outputNote << "commandBuffers=" << renderCounters.commandBufferCount
+                   << " waits=" << renderCounters.waitCount
+                   << " fieldBatchDepth=" << renderCounters.fieldZoneBatchDepth;
+        LogLensDiffDiagnosticEvent("metal-output-ready", outputNote.str());
+    }
     logTimingBreakdown();
     return outputOk;
     }
