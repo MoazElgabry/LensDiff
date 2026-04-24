@@ -157,7 +157,7 @@ if(APPLE)
   if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/VkFFT/vkFFT/vkFFT.h")
     message(FATAL_ERROR "Missing vendored VkFFT at ${CMAKE_CURRENT_SOURCE_DIR}/external/VkFFT.")
   endif()
-  target_include_directories(${PLUGIN_BASENAME} PRIVATE
+  target_include_directories(${PLUGIN_BASENAME} SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/external/VkFFT/vkFFT
     ${CMAKE_CURRENT_SOURCE_DIR}/external/VkFFT/metal-cpp)
   target_compile_definitions(${PLUGIN_BASENAME} PRIVATE VKFFT_BACKEND=5)
@@ -172,6 +172,10 @@ if(APPLE)
   target_compile_options(${PLUGIN_BASENAME} PRIVATE
     $<$<COMPILE_LANGUAGE:OBJC>:-fobjc-arc>
     $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+  set_source_files_properties(
+    src/metal/LensDiffMetalVkFFT.mm
+    PROPERTIES
+      COMPILE_OPTIONS "-Wno-deprecated-declarations;-Wno-deprecated")
 
   find_program(XCRUN_EXECUTABLE xcrun REQUIRED)
   set(GENERATED_METAL_SOURCE "${GENERATED_ASSET_DIR}/${PLUGIN_BASENAME}Shaders.metal")
