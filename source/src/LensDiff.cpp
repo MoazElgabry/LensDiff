@@ -3396,9 +3396,7 @@ void LensDiffEffect::refreshDynamicControlVisibility() {
     setParamState(extractionMode_, !simpleMode);
     setParamState(pointEmphasis_, !simpleMode);
     setParamState(apodizationMode_, !simpleMode);
-    // Keep the phase master toggle available in Simple mode even though the
-    // advanced phase group itself stays hidden there.
-    setParamState(phaseEnabled_, true);
+    setParamState(phaseEnabled_, !simpleMode);
 
     if (!simpleMode) return;
 

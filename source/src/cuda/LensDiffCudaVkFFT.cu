@@ -4,7 +4,7 @@
 #define VKFFT_BACKEND 1
 #endif
 
-#include "../../external/VkFFT/vkFFT/vkFFT.h"
+#include <vkFFT.h>
 
 #include <algorithm>
 #include <chrono>
