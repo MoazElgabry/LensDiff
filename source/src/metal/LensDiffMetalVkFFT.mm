@@ -120,11 +120,15 @@ bool initializePlan(id<MTLCommandBuffer> commandBuffer,
     configuration.size[0] = static_cast<pfUINT>(size);
     configuration.size[1] = static_cast<pfUINT>(size);
     configuration.numberBatches = static_cast<pfUINT>(imageCount);
-    configuration.normalize = 1;
+    configuration.normalize = 0;
     configuration.device = deviceCpp;
     configuration.queue = queueCpp;
     configuration.buffer = &plan->configBuffer;
     configuration.bufferSize = &plan->configBufferSize;
+    configuration.useLUT = 1;
+    configuration.performR2C = 0;
+    configuration.makeForwardPlanOnly = 0;
+    configuration.makeInversePlanOnly = 0;
 
     const VkFFTResult result = initializeVkFFT(&plan->app, configuration);
     if (result != VKFFT_SUCCESS) {

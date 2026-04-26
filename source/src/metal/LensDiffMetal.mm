@@ -2039,8 +2039,8 @@ kernel void lensDiffExtractRealPlaneKernel(device const float2* spectrum [[buffe
     }
     const uint srcIndex = gid.y * uint(params.paddedSize) + gid.x;
     const uint dstIndex = gid.y * uint(params.width) + gid.x;
-    // Metal inverse FFT paths already normalize the spatial result.
-    dst[dstIndex] = max(0.0f, spectrum[srcIndex].x);
+    const float scale = 1.0f / max(float(params.batchStride), 1.0f);
+    dst[dstIndex] = max(0.0f, spectrum[srcIndex].x * scale);
 }
 
 kernel void lensDiffPackPlanesToRgbaKernel(device const float* rPlane [[buffer(0)]],
@@ -3990,9 +3990,6 @@ bool encodeBatchedInverseFft(id<MTLComputeCommandEncoder> encoder,
         [encoder setBuffer:fftParamsBuffer offset:0 atIndex:2];
         dispatch2d(encoder, pipelines->copyComplexBatched, length, batchCount);
     }
-    [encoder setBuffer:src offset:0 atIndex:0];
-    [encoder setBuffer:fftParamsBuffer offset:0 atIndex:1];
-    dispatch2d(encoder, pipelines->scaleComplexBatched, length, batchCount);
     return true;
 }
 

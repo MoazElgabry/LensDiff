@@ -1532,14 +1532,16 @@ void showLensDiffPresetInfoDialog(const std::string& text) {
         std::string safe = text;
         for (char& c : safe) if (c == '"') c = '\'';
         const std::string cmd = "zenity --info --title=\"LensDiff\" --text=\"" + safe + "\" 2>/dev/null";
-        (void)std::system(cmd.c_str());
+        const int result = std::system(cmd.c_str());
+        (void)result;
         return;
     }
     if (linuxLensDiffCommandExists("kdialog")) {
         std::string safe = text;
         for (char& c : safe) if (c == '"') c = '\'';
         const std::string cmd = "kdialog --msgbox \"" + safe + "\" 2>/dev/null";
-        (void)std::system(cmd.c_str());
+        const int result = std::system(cmd.c_str());
+        (void)result;
         return;
     }
     std::fprintf(stderr, "[LensDiff] %s\n", text.c_str());

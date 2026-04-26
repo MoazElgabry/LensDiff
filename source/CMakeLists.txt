@@ -156,6 +156,10 @@ if(LENSDIFF_HAS_CUDA)
     set_target_properties(${PLUGIN_BASENAME} PROPERTIES
       CUDA_RUNTIME_LIBRARY Shared)
   endif()
+  target_compile_options(${PLUGIN_BASENAME} PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=68>
+    $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=177>
+    $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=550>)
 endif()
 
 if(MSVC)
