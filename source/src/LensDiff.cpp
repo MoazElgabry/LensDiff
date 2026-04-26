@@ -58,7 +58,10 @@ constexpr const char* kPluginVersionLabel = "v0.2.5";
 constexpr const char* kPluginDisplayVersion = "0.2.5";
 constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
 
-constexpr bool kSupportsTiles = true;
+// LensDiff's FFT convolution depends on neighboring pixels and stable frame geometry.
+// Advertising tile support lets hosts submit partial image bounds that are not a
+// complete, deterministic input for the current render path.
+constexpr bool kSupportsTiles = false;
 constexpr bool kSupportsMultiResolution = true;
 constexpr bool kSupportsMultipleClipPARs = false;
 constexpr int kDefaultApertureChoiceIndex = 1;
@@ -3391,7 +3394,9 @@ void LensDiffEffect::refreshDynamicControlVisibility() {
     setParamState(extractionMode_, !simpleMode);
     setParamState(pointEmphasis_, !simpleMode);
     setParamState(apodizationMode_, !simpleMode);
-    setParamState(phaseEnabled_, !simpleMode);
+    // Keep the phase master toggle available in Simple mode even though the
+    // advanced phase group itself stays hidden there.
+    setParamState(phaseEnabled_, true);
 
     if (!simpleMode) return;
 

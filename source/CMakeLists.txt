@@ -112,6 +112,7 @@ add_library(${PLUGIN_BASENAME} SHARED
   src/core/LensDiffTransfer.cpp
   ${COMMON_COLOR_DIR}/ColorManagement.cpp
   $<$<BOOL:${LENSDIFF_HAS_CUDA}>:src/cuda/LensDiffCuda.cu>
+  $<$<BOOL:${LENSDIFF_HAS_CUDA}>:src/cuda/LensDiffCudaVkFFT.cu>
   $<$<PLATFORM_ID:Darwin>:src/core/LensDiffFileDialog.mm>
   $<$<PLATFORM_ID:Darwin>:src/metal/LensDiffMetal.mm>
   $<$<PLATFORM_ID:Darwin>:src/metal/LensDiffMetalVkFFT.mm>
@@ -130,8 +131,23 @@ target_link_libraries(${PLUGIN_BASENAME} PRIVATE Threads::Threads)
 
 if(LENSDIFF_HAS_CUDA)
   target_compile_definitions(${PLUGIN_BASENAME} PRIVATE LENSDIFF_HAS_CUDA)
-  target_include_directories(${PLUGIN_BASENAME} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-  target_link_libraries(${PLUGIN_BASENAME} PRIVATE CUDA::cudart CUDA::cufft)
+  target_include_directories(${PLUGIN_BASENAME} SYSTEM PRIVATE
+    ${CUDAToolkit_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/VkFFT/vkFFT)
+  target_link_libraries(${PLUGIN_BASENAME} PRIVATE CUDA::cudart CUDA::cufft CUDA::nvrtc)
+  if(TARGET CUDA::cuda_driver)
+    target_link_libraries(${PLUGIN_BASENAME} PRIVATE CUDA::cuda_driver)
+  else()
+    find_library(LENSDIFF_CUDA_DRIVER_LIBRARY NAMES cuda cuda.lib
+      HINTS
+        ${CUDAToolkit_LIBRARY_DIR}
+        ${CUDAToolkit_LIBRARY_ROOT}
+        "${CUDAToolkit_ROOT}/lib/x64"
+        "${CUDAToolkit_ROOT}/lib64")
+    if(LENSDIFF_CUDA_DRIVER_LIBRARY)
+      target_link_libraries(${PLUGIN_BASENAME} PRIVATE ${LENSDIFF_CUDA_DRIVER_LIBRARY})
+    endif()
+  endif()
   set_target_properties(${PLUGIN_BASENAME} PROPERTIES
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
@@ -210,6 +226,13 @@ if(APPLE)
 
   add_custom_target(${PLUGIN_BASENAME}MetalLibrary ALL DEPENDS "${GENERATED_METAL_LIBRARY}")
   add_dependencies(${PLUGIN_BASENAME} ${PLUGIN_BASENAME}MetalLibrary)
+endif()
+
+if(LENSDIFF_HAS_CUDA)
+  set_source_files_properties(
+    src/cuda/LensDiffCudaVkFFT.cu
+    PROPERTIES
+      COMPILE_DEFINITIONS "VKFFT_BACKEND=1")
 endif()
 
 set_target_properties(${PLUGIN_BASENAME} PROPERTIES

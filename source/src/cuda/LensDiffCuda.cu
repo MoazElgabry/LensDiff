@@ -1,4 +1,5 @@
 #include "LensDiffCuda.h"
+#include "LensDiffCudaVkFFT.h"
 
 #include "../core/LensDiffApertureImage.h"
 #include "../core/LensDiffCpuReference.h"
@@ -128,6 +129,41 @@ enum class CudaPlanLayoutKind : int {
     Batched2D = 1,
 };
 
+enum class CudaFftBackend : int {
+    CuFFT = 0,
+    VkFFT = 1,
+};
+
+enum class CudaFftSubsystem : int {
+    GlobalRender = 0,
+    PsfBank = 1,
+    FieldRender = 2,
+};
+
+enum class CudaFftPolicy : int {
+    Auto = 0,
+    Legacy = 1,
+    VkFFTFirst = 2,
+};
+
+enum class CudaFftBackendOverride : int {
+    Default = 0,
+    CuFFT = 1,
+    VkFFT = 2,
+};
+
+struct CudaSubsystemFftStats {
+    std::string requested = "default";
+    std::string effective = "none";
+    std::string fallback;
+    int cufftPlanCacheHits = 0;
+    int cufftPlanCacheMisses = 0;
+    int vkfftPlanCacheHits = 0;
+    int vkfftPlanCacheMisses = 0;
+    double vkfftCompileInitMs = 0.0;
+    std::size_t maxPlanWorkBytes = 0;
+};
+
 struct CudaPlanKey {
     int width = 0;
     int height = 0;
@@ -154,6 +190,8 @@ struct CudaPlanKeyHasher {
 
 struct CudaPsfBuildContext {
     DeviceBuffer<float> rawPsf;
+    DeviceBuffer<float> shiftedIntensity;
+    DeviceBuffer<cufftComplex> rawSpectrum;
     DeviceBuffer<float> baseKernel;
     DeviceBuffer<float> meanKernel;
     DeviceBuffer<float> shapedKernel;
@@ -259,6 +297,28 @@ struct CudaPlanLease {
     }
 };
 
+struct CudaFftPlanLease {
+    CudaFftBackend backend = CudaFftBackend::CuFFT;
+    CudaPlanLease cufftLease;
+    LensDiffCudaVkFFTPlanLease vkfftLease;
+
+    CudaFftPlanLease() = default;
+    CudaFftPlanLease(const CudaFftPlanLease&) = delete;
+    CudaFftPlanLease& operator=(const CudaFftPlanLease&) = delete;
+
+    CudaFftPlanLease(CudaFftPlanLease&&) noexcept = default;
+    CudaFftPlanLease& operator=(CudaFftPlanLease&&) noexcept = default;
+
+    void release() {
+        cufftLease.release();
+        vkfftLease.release();
+    }
+
+    std::size_t workBytes() const {
+        return backend == CudaFftBackend::VkFFT ? vkfftLease.workBytes() : cufftLease.workBytes();
+    }
+};
+
 struct CudaRenderTimingBreakdown {
     double psfBankMs = 0.0;
     double sourceFftMs = 0.0;
@@ -270,17 +330,20 @@ struct CudaRenderTimingBreakdown {
     double nativeResampleMs = 0.0;
     double compositeMs = 0.0;
     double outputCopyMs = 0.0;
-    int planCacheHits = 0;
-    int planCacheMisses = 0;
     int rgbSourceCacheHits = 0;
     int rgbSourceCacheMisses = 0;
     int scalarSourceCacheHits = 0;
     int scalarSourceCacheMisses = 0;
     int kernelCacheHits = 0;
     int kernelCacheMisses = 0;
+    int cufftPlanCacheHits = 0;
+    int cufftPlanCacheMisses = 0;
+    int vkfftPlanCacheHits = 0;
+    int vkfftPlanCacheMisses = 0;
     int fieldZoneBatchDepth = 0;
     int hostSyncCount = 0;
     std::size_t maxPlanWorkBytes = 0;
+    double vkfftCompileInitMs = 0.0;
     std::uint64_t fieldScratchEstimateBytes = 0;
     std::uint64_t fieldKeyHash = 0;
     std::uint64_t psfKeyHash = 0;
@@ -294,6 +357,13 @@ struct CudaRenderTimingBreakdown {
     std::string validationNote;
     std::string fieldBranch;
     std::string fieldWeightSpace;
+    std::string fftPolicy = "vkfft-first";
+    std::string fftRequested = "vkfft";
+    std::string fftEffective = "vkfft";
+    std::string fftFallbackNote;
+    CudaSubsystemFftStats globalFft;
+    CudaSubsystemFftStats psfFft;
+    CudaSubsystemFftStats fieldFft;
 };
 
 struct CudaRenderContext {
@@ -313,13 +383,15 @@ std::uint64_t hashBytesFnv1a64(const void* data, std::size_t byteCount) {
     return hash;
 }
 
-std::string persistentKernelSpectrumCacheKey(int deviceId,
+std::string persistentKernelSpectrumCacheKey(const std::string& cacheNamespace,
+                                             int deviceId,
                                              const LensDiffKernel& kernel,
                                              int paddedWidth,
                                              int paddedHeight) {
     const std::uint64_t valueHash =
         hashBytesFnv1a64(kernel.values.data(), kernel.values.size() * sizeof(float));
-    return std::to_string(deviceId) + ":" +
+    return cacheNamespace + ":" +
+           std::to_string(deviceId) + ":" +
            std::to_string(kernel.size) + ":" +
            std::to_string(kernel.values.size()) + ":" +
            std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) + ":" +
@@ -2302,7 +2374,7 @@ bool acquirePlan(PersistentCudaPlanRepository* repository,
     outPlan->release();
     if (repository == nullptr) {
         if (timing != nullptr) {
-            ++timing->planCacheMisses;
+            ++timing->cufftPlanCacheMisses;
         }
         if (batchCount == 1) {
             return createPlan(&outPlan->standaloneHandle, width, height, stream, error);
@@ -2339,7 +2411,7 @@ bool acquirePlan(PersistentCudaPlanRepository* repository,
             entryPtr->inUse = true;
             entryPtr->stamp = ++repository->nextStamp;
             if (timing != nullptr) {
-                ++timing->planCacheHits;
+                ++timing->cufftPlanCacheHits;
                 timing->maxPlanWorkBytes = std::max(timing->maxPlanWorkBytes, entryPtr->workBytes);
             }
             if (entryPtr->readyEvent != nullptr &&
@@ -2362,7 +2434,7 @@ bool acquirePlan(PersistentCudaPlanRepository* repository,
     }
 
     if (timing != nullptr) {
-        ++timing->planCacheMisses;
+        ++timing->cufftPlanCacheMisses;
     }
 
     const int n[2] = {height, width};
@@ -2413,6 +2485,155 @@ bool acquirePlan(PersistentCudaPlanRepository* repository,
     return true;
 }
 
+bool LensDiffCudaVkFFTStrictEnabled();
+CudaFftPolicy LensDiffCudaFftPolicy();
+CudaFftBackendOverride LensDiffCudaSubsystemFftOverride(CudaFftSubsystem subsystem);
+const char* cudaFftBackendName(CudaFftBackend backend);
+const char* cudaFftSubsystemName(CudaFftSubsystem subsystem);
+const char* cudaFftPolicyName(CudaFftPolicy policy);
+int cudaVkfftRepositoryTag(CudaFftSubsystem subsystem);
+CudaSubsystemFftStats* cudaSubsystemFftStats(CudaRenderTimingBreakdown* timing, CudaFftSubsystem subsystem);
+void recordCudaFftBackendUse(CudaRenderTimingBreakdown* timing, CudaFftSubsystem subsystem, CudaFftBackend backend);
+void recordCudaFftFallback(CudaRenderTimingBreakdown* timing,
+                           CudaFftSubsystem subsystem,
+                           CudaFftBackend fromBackend,
+                           CudaFftBackend toBackend,
+                           const std::string& reason);
+void recordCudaFftPolicySelection(CudaRenderTimingBreakdown* timing,
+                                  CudaFftSubsystem subsystem,
+                                  CudaFftBackend requestedBackend);
+CudaFftBackend resolveCudaFftBackendForSubsystem(CudaFftSubsystem subsystem,
+                                                 CudaFftBackend globalRequestedBackend,
+                                                 CudaFftPolicy policy,
+                                                 CudaRenderTimingBreakdown* timing);
+bool usePersistentVkfftRepositoryForSubsystem(CudaFftSubsystem subsystem,
+                                              CudaFftPolicy policy,
+                                              bool persistentPlanRepositoryEnabled);
+
+bool acquireFftPlan(CudaFftSubsystem subsystem,
+                    CudaFftBackend requestedBackend,
+                    bool vkfftStrict,
+                    PersistentCudaPlanRepository* cufftRepository,
+                    bool vkfftPersistentRepository,
+                    int width,
+                    int height,
+                    int batchCount,
+                    cudaStream_t stream,
+                    CudaRenderTimingBreakdown* timing,
+                    CudaFftPlanLease* outPlan,
+                    std::string* error) {
+    if (outPlan == nullptr) {
+        if (error) {
+            *error = "cuda-null-fft-plan-request";
+        }
+        return false;
+    }
+    outPlan->release();
+    outPlan->backend = requestedBackend;
+    if (requestedBackend == CudaFftBackend::VkFFT) {
+        double initMs = 0.0;
+        bool cacheHit = false;
+        std::string vkfftError;
+        if (lensDiffCudaVkFFTAcquirePlan(vkfftPersistentRepository,
+                                         cudaVkfftRepositoryTag(subsystem),
+                                         width,
+                                         height,
+                                         batchCount,
+                                         stream,
+                                         &initMs,
+                                         &cacheHit,
+                                         &outPlan->vkfftLease,
+                                         &vkfftError)) {
+            outPlan->backend = CudaFftBackend::VkFFT;
+            if (timing != nullptr) {
+                timing->vkfftCompileInitMs += initMs;
+                if (cacheHit) {
+                    ++timing->vkfftPlanCacheHits;
+                } else {
+                    ++timing->vkfftPlanCacheMisses;
+                }
+                timing->maxPlanWorkBytes = std::max(timing->maxPlanWorkBytes, outPlan->workBytes());
+                if (CudaSubsystemFftStats* stats = cudaSubsystemFftStats(timing, subsystem)) {
+                    stats->vkfftCompileInitMs += initMs;
+                    if (cacheHit) {
+                        ++stats->vkfftPlanCacheHits;
+                    } else {
+                        ++stats->vkfftPlanCacheMisses;
+                    }
+                    stats->maxPlanWorkBytes = std::max(stats->maxPlanWorkBytes, outPlan->workBytes());
+                }
+            }
+            recordCudaFftBackendUse(timing, subsystem, CudaFftBackend::VkFFT);
+            return true;
+        }
+        if (vkfftStrict) {
+            if (error != nullptr) {
+                *error = vkfftError;
+            }
+            return false;
+        }
+        recordCudaFftFallback(timing, subsystem, CudaFftBackend::VkFFT, CudaFftBackend::CuFFT, vkfftError);
+    }
+
+    if (!acquirePlan(cufftRepository, width, height, batchCount, stream, timing, &outPlan->cufftLease, error)) {
+        return false;
+    }
+    if (timing != nullptr) {
+        if (CudaSubsystemFftStats* stats = cudaSubsystemFftStats(timing, subsystem)) {
+            if (outPlan->cufftLease.entry != nullptr) {
+                ++stats->cufftPlanCacheHits;
+                stats->maxPlanWorkBytes = std::max(stats->maxPlanWorkBytes, outPlan->workBytes());
+            } else {
+                ++stats->cufftPlanCacheMisses;
+            }
+        }
+    }
+    outPlan->backend = CudaFftBackend::CuFFT;
+    recordCudaFftBackendUse(timing, subsystem, CudaFftBackend::CuFFT);
+    return true;
+}
+
+bool execFftC2C(CudaFftPlanLease* plan,
+                CudaFftSubsystem subsystem,
+                DeviceBuffer<cufftComplex>& buffer,
+                bool inverse,
+                int width,
+                int height,
+                cudaStream_t stream,
+                CudaRenderTimingBreakdown* timing,
+                std::string* error) {
+    if (plan == nullptr) {
+        if (error) {
+            *error = "cuda-null-fft-plan";
+        }
+        return false;
+    }
+    if (plan->backend == CudaFftBackend::VkFFT) {
+        if (lensDiffCudaVkFFTExecC2C(&plan->vkfftLease, buffer.ptr, inverse, error)) {
+            return true;
+        }
+        if (LensDiffCudaVkFFTStrictEnabled()) {
+            return false;
+        }
+        std::string fallbackReason = error != nullptr ? *error : "cuda-vkfft-exec-failed";
+        recordCudaFftFallback(timing, subsystem, CudaFftBackend::VkFFT, CudaFftBackend::CuFFT, fallbackReason);
+        plan->release();
+        if (!createPlan(&plan->cufftLease.standaloneHandle, width, height, stream, error)) {
+            return false;
+        }
+        plan->backend = CudaFftBackend::CuFFT;
+        if (error != nullptr) {
+            *error = fallbackReason;
+        }
+    }
+    return checkCufft(cufftExecC2C(plan->cufftLease.handle(),
+                                   buffer.ptr,
+                                   buffer.ptr,
+                                   inverse ? CUFFT_INVERSE : CUFFT_FORWARD),
+                      inverse ? "cufftExecC2C-inverse-fallback" : "cufftExecC2C-forward-fallback",
+                      error);
+}
+
 bool LensDiffCudaLegacyPipelineEnabled() {
     const char* value = std::getenv("LENSDIFF_CUDA_LEGACY_PIPELINE");
     if (value == nullptr || *value == '\0') {
@@ -2429,6 +2650,201 @@ bool LensDiffCudaPersistentPlanRepositoryEnabled() {
     }
     const std::string text(value);
     return text != "0" && text != "false" && text != "FALSE" && text != "off" && text != "OFF";
+}
+
+CudaFftPolicy LensDiffCudaFftPolicy() {
+    const char* value = std::getenv("LENSDIFF_CUDA_FFT_POLICY");
+    if (value == nullptr || *value == '\0') {
+        return CudaFftPolicy::VkFFTFirst;
+    }
+    const std::string text(value);
+    if (text == "legacy" || text == "LEGACY") {
+        return CudaFftPolicy::Legacy;
+    }
+    if (text == "auto" || text == "AUTO") {
+        return CudaFftPolicy::Auto;
+    }
+    return CudaFftPolicy::VkFFTFirst;
+}
+
+CudaFftBackendOverride parseCudaFftBackendOverrideEnv(const char* envName) {
+    const char* value = std::getenv(envName);
+    if (value == nullptr || *value == '\0') {
+        return CudaFftBackendOverride::Default;
+    }
+    const std::string text(value);
+    if (text == "cufft" || text == "CUFFT" || text == "cuFFT" || text == "CuFFT") {
+        return CudaFftBackendOverride::CuFFT;
+    }
+    if (text == "vkfft" || text == "VKFFT" || text == "VkFFT") {
+        return CudaFftBackendOverride::VkFFT;
+    }
+    return CudaFftBackendOverride::Default;
+}
+
+CudaFftBackendOverride LensDiffCudaSubsystemFftOverride(CudaFftSubsystem subsystem) {
+    switch (subsystem) {
+        case CudaFftSubsystem::PsfBank:
+            return parseCudaFftBackendOverrideEnv("LENSDIFF_CUDA_PSF_FFT_BACKEND");
+        case CudaFftSubsystem::FieldRender:
+            return parseCudaFftBackendOverrideEnv("LENSDIFF_CUDA_FIELD_FFT_BACKEND");
+        case CudaFftSubsystem::GlobalRender:
+        default:
+            return parseCudaFftBackendOverrideEnv("LENSDIFF_CUDA_GLOBAL_FFT_BACKEND");
+    }
+}
+
+CudaFftBackend LensDiffCudaRequestedFftBackend() {
+    const char* value = std::getenv("LENSDIFF_CUDA_FFT_BACKEND");
+    if (value == nullptr || *value == '\0') {
+        return CudaFftBackend::VkFFT;
+    }
+    const std::string text(value);
+    if (text == "cufft" || text == "CUFFT" || text == "cuFFT" || text == "CuFFT") {
+        return CudaFftBackend::CuFFT;
+    }
+    return CudaFftBackend::VkFFT;
+}
+
+bool LensDiffCudaVkFFTStrictEnabled() {
+    const char* value = std::getenv("LENSDIFF_CUDA_VKFFT_STRICT");
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    const std::string text(value);
+    return text != "0" && text != "false" && text != "FALSE" && text != "off" && text != "OFF";
+}
+
+const char* cudaFftBackendName(CudaFftBackend backend) {
+    return backend == CudaFftBackend::VkFFT ? "vkfft" : "cufft";
+}
+
+const char* cudaFftSubsystemName(CudaFftSubsystem subsystem) {
+    switch (subsystem) {
+        case CudaFftSubsystem::PsfBank: return "psf";
+        case CudaFftSubsystem::FieldRender: return "field";
+        case CudaFftSubsystem::GlobalRender:
+        default: return "global";
+    }
+}
+
+const char* cudaFftPolicyName(CudaFftPolicy policy) {
+    switch (policy) {
+        case CudaFftPolicy::Legacy: return "legacy";
+        case CudaFftPolicy::Auto: return "auto";
+        case CudaFftPolicy::VkFFTFirst:
+        default: return "vkfft-first";
+    }
+}
+
+int cudaVkfftRepositoryTag(CudaFftSubsystem subsystem) {
+    switch (subsystem) {
+        case CudaFftSubsystem::PsfBank: return 1;
+        case CudaFftSubsystem::FieldRender: return 2;
+        case CudaFftSubsystem::GlobalRender:
+        default: return 0;
+    }
+}
+
+std::string cudaFftCacheNamespace(CudaFftSubsystem subsystem, CudaFftBackend backend) {
+    return std::string(cudaFftSubsystemName(subsystem)) + ":" + cudaFftBackendName(backend);
+}
+
+CudaSubsystemFftStats* cudaSubsystemFftStats(CudaRenderTimingBreakdown* timing, CudaFftSubsystem subsystem) {
+    if (timing == nullptr) {
+        return nullptr;
+    }
+    switch (subsystem) {
+        case CudaFftSubsystem::PsfBank: return &timing->psfFft;
+        case CudaFftSubsystem::FieldRender: return &timing->fieldFft;
+        case CudaFftSubsystem::GlobalRender:
+        default: return &timing->globalFft;
+    }
+}
+
+void recordCudaFftPolicySelection(CudaRenderTimingBreakdown* timing,
+                                  CudaFftSubsystem subsystem,
+                                  CudaFftBackend requestedBackend) {
+    if (CudaSubsystemFftStats* stats = cudaSubsystemFftStats(timing, subsystem)) {
+        stats->requested = cudaFftBackendName(requestedBackend);
+    }
+}
+
+CudaFftBackend resolveCudaFftBackendForSubsystem(CudaFftSubsystem subsystem,
+                                                 CudaFftBackend globalRequestedBackend,
+                                                 CudaFftPolicy policy,
+                                                 CudaRenderTimingBreakdown* timing) {
+    const CudaFftBackendOverride backendOverride = LensDiffCudaSubsystemFftOverride(subsystem);
+    if (backendOverride == CudaFftBackendOverride::CuFFT) {
+        recordCudaFftPolicySelection(timing, subsystem, CudaFftBackend::CuFFT);
+        return CudaFftBackend::CuFFT;
+    }
+    if (backendOverride == CudaFftBackendOverride::VkFFT) {
+        recordCudaFftPolicySelection(timing, subsystem, CudaFftBackend::VkFFT);
+        return CudaFftBackend::VkFFT;
+    }
+
+    CudaFftBackend resolved = globalRequestedBackend;
+    if (policy == CudaFftPolicy::Legacy) {
+        resolved = CudaFftBackend::CuFFT;
+    }
+    recordCudaFftPolicySelection(timing, subsystem, resolved);
+    return resolved;
+}
+
+bool usePersistentVkfftRepositoryForSubsystem(CudaFftSubsystem subsystem,
+                                              CudaFftPolicy policy,
+                                              bool persistentPlanRepositoryEnabled) {
+    if (policy == CudaFftPolicy::Legacy) {
+        return persistentPlanRepositoryEnabled;
+    }
+    if (subsystem == CudaFftSubsystem::PsfBank || subsystem == CudaFftSubsystem::FieldRender) {
+        return true;
+    }
+    return persistentPlanRepositoryEnabled || policy == CudaFftPolicy::VkFFTFirst || policy == CudaFftPolicy::Auto;
+}
+
+void recordCudaFftBackendUse(CudaRenderTimingBreakdown* timing, CudaFftSubsystem subsystem, CudaFftBackend backend) {
+    if (timing == nullptr) {
+        return;
+    }
+    const std::string name(cudaFftBackendName(backend));
+    if (timing->fftEffective.empty()) {
+        timing->fftEffective = name;
+    } else if (timing->fftEffective != name && timing->fftEffective != "mixed") {
+        timing->fftEffective = "mixed";
+    }
+    if (CudaSubsystemFftStats* stats = cudaSubsystemFftStats(timing, subsystem)) {
+        if (stats->effective == "none") {
+            stats->effective = name;
+        } else if (stats->effective != name && stats->effective != "mixed") {
+            stats->effective = "mixed";
+        }
+    }
+}
+
+void recordCudaFftFallback(CudaRenderTimingBreakdown* timing,
+                           CudaFftSubsystem subsystem,
+                           CudaFftBackend fromBackend,
+                           CudaFftBackend toBackend,
+                           const std::string& reason) {
+    if (timing == nullptr) {
+        return;
+    }
+    recordCudaFftBackendUse(timing, subsystem, toBackend);
+    if (!timing->fftFallbackNote.empty()) {
+        timing->fftFallbackNote += ";";
+    }
+    timing->fftFallbackNote += std::string(cudaFftBackendName(fromBackend)) +
+                               "->" + cudaFftBackendName(toBackend) +
+                               ":" + reason;
+    if (CudaSubsystemFftStats* stats = cudaSubsystemFftStats(timing, subsystem)) {
+        if (!stats->fallback.empty()) {
+            stats->fallback += ";";
+        }
+        stats->fallback += std::string(cudaFftBackendName(fromBackend)) + "->" +
+                           cudaFftBackendName(toBackend) + ":" + reason;
+    }
 }
 
 FieldZoneBatchPlan buildFieldZoneBatchPlan(const LensDiffPsfBankCache& cache) {
@@ -2510,12 +2926,14 @@ bool normalizeDeviceBufferGpu(DeviceBuffer<float>& buffer,
 }
 
 bool makeImageSpectrum(const float* src,
+                       CudaFftSubsystem subsystem,
                        int width,
                        int height,
                        int paddedWidth,
                        int paddedHeight,
-                       cufftHandle plan,
+                       CudaFftPlanLease* plan,
                        cudaStream_t stream,
+                       CudaRenderTimingBreakdown* timing,
                        DeviceBuffer<cufftComplex>& out,
                        std::string* error) {
     const std::size_t count = static_cast<std::size_t>(paddedWidth) * paddedHeight;
@@ -2531,7 +2949,7 @@ bool makeImageSpectrum(const float* src,
         return false;
     }
 
-    return checkCufft(cufftExecC2C(plan, out.ptr, out.ptr, CUFFT_FORWARD), "cufftExecC2C-forward-image", error);
+    return execFftC2C(plan, subsystem, out, false, paddedWidth, paddedHeight, stream, timing, error);
 }
 
 bool makeImageSpectrumWindow(const float* src,
@@ -2543,8 +2961,9 @@ bool makeImageSpectrumWindow(const float* src,
                              int windowHeight,
                              int paddedWidth,
                              int paddedHeight,
-                             cufftHandle plan,
+                             CudaFftPlanLease* plan,
                              cudaStream_t stream,
+                             CudaRenderTimingBreakdown* timing,
                              DeviceBuffer<cufftComplex>& out,
                              std::string* error) {
     const std::size_t count = static_cast<std::size_t>(paddedWidth) * paddedHeight;
@@ -2570,14 +2989,16 @@ bool makeImageSpectrumWindow(const float* src,
         return false;
     }
 
-    return checkCufft(cufftExecC2C(plan, out.ptr, out.ptr, CUFFT_FORWARD), "cufftExecC2C-forward-image-window", error);
+    return execFftC2C(plan, CudaFftSubsystem::GlobalRender, out, false, paddedWidth, paddedHeight, stream, timing, error);
 }
 
 bool makeKernelSpectrum(const LensDiffKernel& kernel,
+                        CudaFftSubsystem subsystem,
                         int paddedWidth,
                         int paddedHeight,
-                        cufftHandle plan,
+                        CudaFftPlanLease* plan,
                         cudaStream_t stream,
+                        CudaRenderTimingBreakdown* timing,
                         DeviceBuffer<float>& deviceKernel,
                         DeviceBuffer<cufftComplex>& out,
                         std::string* error) {
@@ -2611,17 +3032,19 @@ bool makeKernelSpectrum(const LensDiffKernel& kernel,
         return false;
     }
 
-    return checkCufft(cufftExecC2C(plan, out.ptr, out.ptr, CUFFT_FORWARD), "cufftExecC2C-forward-kernel", error);
+    return execFftC2C(plan, subsystem, out, false, paddedWidth, paddedHeight, stream, timing, error);
 }
 
 bool convolveSpectrumToPlane(const DeviceBuffer<cufftComplex>& imageSpectrum,
                              const DeviceBuffer<cufftComplex>& kernelSpectrum,
+                             CudaFftSubsystem subsystem,
                              int width,
                              int height,
                              int paddedWidth,
                              int paddedHeight,
-                             cufftHandle plan,
+                             CudaFftPlanLease* plan,
                              cudaStream_t stream,
+                             CudaRenderTimingBreakdown* timing,
                              DeviceBuffer<cufftComplex>& tempSpectrum,
                              DeviceBuffer<float>& outPlane,
                              std::string* error) {
@@ -2639,7 +3062,7 @@ bool convolveSpectrumToPlane(const DeviceBuffer<cufftComplex>& imageSpectrum,
         return false;
     }
 
-    if (!checkCufft(cufftExecC2C(plan, tempSpectrum.ptr, tempSpectrum.ptr, CUFFT_INVERSE), "cufftExecC2C-inverse", error)) {
+    if (!execFftC2C(plan, subsystem, tempSpectrum, true, paddedWidth, paddedHeight, stream, timing, error)) {
         return false;
     }
 
@@ -2652,15 +3075,17 @@ bool convolveSpectrumToPlane(const DeviceBuffer<cufftComplex>& imageSpectrum,
 
 bool convolveSpectrumStackToPlaneStack(const DeviceBuffer<cufftComplex>& imageSpectrumStack,
                                        const DeviceBuffer<cufftComplex>& kernelSpectrumStack,
+                                       CudaFftSubsystem subsystem,
                                        int width,
                                        int height,
                                        int paddedWidth,
                                        int paddedHeight,
                                        int batchCount,
-                                       cufftHandle plan,
+                                       CudaFftPlanLease* plan,
                                        cudaStream_t stream,
                                        DeviceBuffer<cufftComplex>& tempSpectrum,
                                        DeviceBuffer<float>& outPlaneStack,
+                                       CudaRenderTimingBreakdown* timing,
                                        std::string* error) {
     const std::size_t paddedCount = static_cast<std::size_t>(paddedWidth) * paddedHeight;
     const std::size_t planeCount = static_cast<std::size_t>(width) * height;
@@ -2679,7 +3104,7 @@ bool convolveSpectrumStackToPlaneStack(const DeviceBuffer<cufftComplex>& imageSp
                                                                                 paddedCount,
                                                                                 batchCount);
     if (!checkCuda(cudaGetLastError(), "multiplyComplexPairsStackKernel", error) ||
-        !checkCufft(cufftExecC2C(plan, tempSpectrum.ptr, tempSpectrum.ptr, CUFFT_INVERSE), "cufftExecC2C-inverse-stack", error)) {
+        !execFftC2C(plan, subsystem, tempSpectrum, true, paddedWidth, paddedHeight, stream, timing, error)) {
         return false;
     }
 
@@ -2845,31 +3270,31 @@ bool buildShiftedRawPsfOnCuda(const DeviceBuffer<float>& devicePupil,
                               const DeviceBuffer<float>* devicePhase,
                               int pupilSize,
                               int rawPsfSize,
+                              CudaFftPolicy fftPolicy,
+                              CudaFftBackend requestedFftBackend,
+                              bool vkfftStrict,
                               cudaStream_t stream,
+                              CudaPsfBuildContext* buildContext,
                               DeviceBuffer<float>* deviceShiftedRawPsf,
                               std::vector<float>* shiftedRawPsfDisplay,
+                              CudaRenderTimingBreakdown* timing,
                               std::string* error) {
-    if (deviceShiftedRawPsf == nullptr) {
+    if (deviceShiftedRawPsf == nullptr || buildContext == nullptr) {
         if (error) *error = "missing-shifted-raw-psf-device-output";
         return false;
     }
 
     const std::size_t rawCount = static_cast<std::size_t>(rawPsfSize) * rawPsfSize;
-    DeviceBuffer<float> deviceShiftedIntensity;
-    DeviceBuffer<cufftComplex> deviceSpectrum;
-    DeviceBuffer<float> normalizeSum;
-    DeviceBuffer<float> normalizeScale;
-    cufftHandle plan = 0;
     const bool usePhase = devicePhase != nullptr && devicePhase->ptr != nullptr;
 
-    if (!deviceShiftedIntensity.allocate(rawCount) ||
+    if (!buildContext->shiftedIntensity.allocate(rawCount) ||
         !deviceShiftedRawPsf->allocate(rawCount) ||
-        !deviceSpectrum.allocate(rawCount)) {
+        !buildContext->rawSpectrum.allocate(rawCount)) {
         if (error) *error = "cuda-alloc-raw-psf-build";
         return false;
     }
 
-    if (!checkCuda(cudaMemsetAsync(deviceSpectrum.ptr, 0, rawCount * sizeof(cufftComplex), stream),
+    if (!checkCuda(cudaMemsetAsync(buildContext->rawSpectrum.ptr, 0, rawCount * sizeof(cufftComplex), stream),
                    "cudaMemsetAsync-raw-psf-spectrum",
                    error)) {
         return false;
@@ -2884,41 +3309,56 @@ bool buildShiftedRawPsfOnCuda(const DeviceBuffer<float>& devicePupil,
         pupilSize,
         rawPsfSize,
         offset,
-        deviceSpectrum.ptr);
+        buildContext->rawSpectrum.ptr);
     if (!checkCuda(cudaGetLastError(), "embedCenteredComplexPupilKernel", error)) {
         return false;
     }
 
-    if (!createPlan(&plan, rawPsfSize, rawPsfSize, stream, error)) {
+    CudaFftPlanLease fftPlan;
+    const CudaFftBackend psfFftBackend =
+        resolveCudaFftBackendForSubsystem(CudaFftSubsystem::PsfBank, requestedFftBackend, fftPolicy, timing);
+    if (!acquireFftPlan(CudaFftSubsystem::PsfBank,
+                        psfFftBackend,
+                        vkfftStrict,
+                        nullptr,
+                        usePersistentVkfftRepositoryForSubsystem(CudaFftSubsystem::PsfBank, fftPolicy, false),
+                        rawPsfSize,
+                        rawPsfSize,
+                        1,
+                        stream,
+                        timing,
+                        &fftPlan,
+                        error)) {
         return false;
     }
 
-    const bool fftOk = checkCufft(cufftExecC2C(plan, deviceSpectrum.ptr, deviceSpectrum.ptr, CUFFT_FORWARD),
-                                  "cufftExecC2C-forward-raw-psf",
-                                  error);
+    const bool fftOk = execFftC2C(&fftPlan, CudaFftSubsystem::PsfBank, buildContext->rawSpectrum, false, rawPsfSize, rawPsfSize, stream, timing, error);
     if (!fftOk) {
-        cufftDestroy(plan);
         return false;
     }
 
     dim3 rawGrid((rawPsfSize + block.x - 1) / block.x, (rawPsfSize + block.y - 1) / block.y);
-    extractShiftedIntensityKernel<<<rawGrid, block, 0, stream>>>(deviceSpectrum.ptr, rawPsfSize, deviceShiftedIntensity.ptr);
+    extractShiftedIntensityKernel<<<rawGrid, block, 0, stream>>>(buildContext->rawSpectrum.ptr,
+                                                                 rawPsfSize,
+                                                                 buildContext->shiftedIntensity.ptr);
     if (!checkCuda(cudaGetLastError(), "extractShiftedIntensityKernel", error)) {
-        cufftDestroy(plan);
         return false;
     }
-    if (!normalizeDeviceBufferGpu(deviceShiftedIntensity, rawCount, &normalizeSum, &normalizeScale, stream, error)) {
-        cufftDestroy(plan);
+    if (!normalizeDeviceBufferGpu(buildContext->shiftedIntensity,
+                                  rawCount,
+                                  &buildContext->reductionScalarA,
+                                  &buildContext->reductionScalarB,
+                                  stream,
+                                  error)) {
         return false;
     }
     if (!checkCuda(cudaMemcpyAsync(deviceShiftedRawPsf->ptr,
-                                   deviceShiftedIntensity.ptr,
+                                   buildContext->shiftedIntensity.ptr,
                                    rawCount * sizeof(float),
                                    cudaMemcpyDeviceToDevice,
                                    stream),
                    "cudaMemcpyAsync-raw-psf-device-copy",
                    error)) {
-        cufftDestroy(plan);
         return false;
     }
     if (shiftedRawPsfDisplay != nullptr) {
@@ -2931,11 +3371,9 @@ bool buildShiftedRawPsfOnCuda(const DeviceBuffer<float>& devicePupil,
                        "cudaMemcpyAsync-raw-psf-readback",
                        error) ||
             !checkCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize-raw-psf-readback", error)) {
-            cufftDestroy(plan);
             return false;
         }
     }
-    cufftDestroy(plan);
     return true;
 }
 
@@ -3812,6 +4250,10 @@ bool createStaticDebugImage(const LensDiffParams& params,
 bool buildPsfBankGlobalOnlyCuda(const LensDiffParams& params,
                                 LensDiffPsfBankCache& cache,
                                 CudaPsfBuildContext* buildContext,
+                                CudaFftPolicy fftPolicy,
+                                CudaFftBackend requestedFftBackend,
+                                bool vkfftStrict,
+                                CudaRenderTimingBreakdown* timing,
                                 cudaStream_t stream,
                                 std::string* error) {
     const LensDiffPsfBankKey key = MakeLensDiffPsfBankKey(params);
@@ -3837,9 +4279,14 @@ bool buildPsfBankGlobalOnlyCuda(const LensDiffParams& params,
                                   hasPhase ? &devicePhase : nullptr,
                                   pupilSize,
                                   rawPsfSize,
+                                  fftPolicy,
+                                  requestedFftBackend,
+                                  vkfftStrict,
                                   stream,
+                                  psfContext,
                                   &psfContext->rawPsf,
                                   nullptr,
+                                  timing,
                                   error)) {
         return false;
     }
@@ -3894,6 +4341,10 @@ bool buildPsfBankGlobalOnlyCuda(const LensDiffParams& params,
 bool buildFieldZoneCachesBatchedCuda(const LensDiffParams& params,
                                      LensDiffPsfBankCache* cache,
                                      CudaPsfBuildContext* buildContext,
+                                     CudaFftPolicy fftPolicy,
+                                     CudaFftBackend requestedFftBackend,
+                                     bool vkfftStrict,
+                                     CudaRenderTimingBreakdown* timing,
                                      cudaStream_t stream,
                                      std::string* error) {
     if (cache == nullptr || buildContext == nullptr) {
@@ -3982,31 +4433,24 @@ bool buildFieldZoneCachesBatchedCuda(const LensDiffParams& params,
         }
     }
 
-    cufftHandle batchPlan = 0;
-    const int n[2] = {rawPsfSize, rawPsfSize};
-    if (!checkCufft(cufftPlanMany(&batchPlan,
-                                  2,
-                                  const_cast<int*>(n),
-                                  nullptr,
-                                  1,
-                                  rawPsfSize * rawPsfSize,
-                                  nullptr,
-                                  1,
-                                  rawPsfSize * rawPsfSize,
-                                  CUFFT_C2C,
-                                  zoneCount),
-                    "cufftPlanMany-field-zone-raw-psf",
-                    error) ||
-        !checkCufft(cufftSetStream(batchPlan, stream), "cufftSetStream-field-zone-raw-psf", error)) {
-        if (batchPlan != 0) {
-            cufftDestroy(batchPlan);
-        }
+    CudaFftPlanLease batchPlan;
+    const CudaFftBackend psfFftBackend =
+        resolveCudaFftBackendForSubsystem(CudaFftSubsystem::PsfBank, requestedFftBackend, fftPolicy, timing);
+    if (!acquireFftPlan(CudaFftSubsystem::PsfBank,
+                        psfFftBackend,
+                        vkfftStrict,
+                        nullptr,
+                        usePersistentVkfftRepositoryForSubsystem(CudaFftSubsystem::PsfBank, fftPolicy, false),
+                        rawPsfSize,
+                        rawPsfSize,
+                        zoneCount,
+                        stream,
+                        timing,
+                        &batchPlan,
+                        error)) {
         return false;
     }
-    const bool fftOk = checkCufft(cufftExecC2C(batchPlan, batchedSpectrum.ptr, batchedSpectrum.ptr, CUFFT_FORWARD),
-                                  "cufftExecC2C-field-zone-raw-psf",
-                                  error);
-    cufftDestroy(batchPlan);
+    const bool fftOk = execFftC2C(&batchPlan, CudaFftSubsystem::PsfBank, batchedSpectrum, false, rawPsfSize, rawPsfSize, stream, timing, error);
     if (!fftOk) {
         return false;
     }
@@ -4073,6 +4517,10 @@ bool buildFieldZoneCachesBatchedCuda(const LensDiffParams& params,
 
 bool buildFieldZoneCachesLegacyCuda(const LensDiffParams& params,
                                     LensDiffPsfBankCache* cache,
+                                    CudaFftPolicy fftPolicy,
+                                    CudaFftBackend requestedFftBackend,
+                                    bool vkfftStrict,
+                                    CudaRenderTimingBreakdown* timing,
                                     cudaStream_t stream,
                                     std::string* error) {
     if (cache == nullptr) {
@@ -4100,7 +4548,15 @@ bool buildFieldZoneCachesLegacyCuda(const LensDiffParams& params,
 
             LensDiffPsfBankCache zoneCache {};
             CudaPsfBuildContext zoneBuildContext {};
-            if (!buildPsfBankGlobalOnlyCuda(zone.resolvedParams, zoneCache, &zoneBuildContext, stream, error)) {
+            if (!buildPsfBankGlobalOnlyCuda(zone.resolvedParams,
+                                           zoneCache,
+                                           &zoneBuildContext,
+                                           fftPolicy,
+                                           requestedFftBackend,
+                                           vkfftStrict,
+                                           timing,
+                                           stream,
+                                           error)) {
                 return false;
             }
             zone.key = zoneCache.key;
@@ -4118,6 +4574,10 @@ bool buildFieldZoneCachesLegacyCuda(const LensDiffParams& params,
 
 bool ensurePsfBankCuda(const LensDiffParams& params,
                        LensDiffPsfBankCache& cache,
+                       CudaFftPolicy fftPolicy,
+                       CudaFftBackend requestedFftBackend,
+                       bool vkfftStrict,
+                       CudaRenderTimingBreakdown* timing,
                        cudaStream_t stream,
                        std::string* error) {
     const LensDiffPsfBankKey key = MakeLensDiffPsfBankKey(params);
@@ -4133,7 +4593,15 @@ bool ensurePsfBankCuda(const LensDiffParams& params,
     }
 
     CudaPsfBuildContext buildContext {};
-    if (!buildPsfBankGlobalOnlyCuda(params, cache, &buildContext, stream, error)) {
+    if (!buildPsfBankGlobalOnlyCuda(params,
+                                    cache,
+                                    &buildContext,
+                                    fftPolicy,
+                                    requestedFftBackend,
+                                    vkfftStrict,
+                                    timing,
+                                    stream,
+                                    error)) {
         return false;
     }
     if (!needFieldZones) {
@@ -4145,10 +4613,25 @@ bool ensurePsfBankCuda(const LensDiffParams& params,
 
     LensDiffScopedTimer timer("cuda-field-zones");
     if (LensDiffCudaBatchedFieldCacheEnabled()) {
-        if (!buildFieldZoneCachesBatchedCuda(params, &cache, &buildContext, stream, error)) {
+        if (!buildFieldZoneCachesBatchedCuda(params,
+                                             &cache,
+                                             &buildContext,
+                                             fftPolicy,
+                                             requestedFftBackend,
+                                             vkfftStrict,
+                                             timing,
+                                             stream,
+                                             error)) {
             return false;
         }
-    } else if (!buildFieldZoneCachesLegacyCuda(params, &cache, stream, error)) {
+    } else if (!buildFieldZoneCachesLegacyCuda(params,
+                                               &cache,
+                                               fftPolicy,
+                                               requestedFftBackend,
+                                               vkfftStrict,
+                                               timing,
+                                               stream,
+                                               error)) {
         return false;
     }
     return true;
@@ -4178,6 +4661,15 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
     const bool validateField = LensDiffCudaFieldValidateEnabled();
     const bool useFrameWeightSpace = LensDiffCudaUseFrameWeightSpace();
     const bool stackedFieldEnabled = LensDiffCudaExperimentalStackedFieldEnabled();
+    const CudaFftPolicy fftPolicy = LensDiffCudaFftPolicy();
+    const CudaFftBackend requestedFftBackend = LensDiffCudaRequestedFftBackend();
+    const bool vkfftStrict = LensDiffCudaVkFFTStrictEnabled();
+    const CudaFftBackend globalRequestedFftBackend =
+        resolveCudaFftBackendForSubsystem(CudaFftSubsystem::GlobalRender, requestedFftBackend, fftPolicy, nullptr);
+    const CudaFftBackend psfRequestedFftBackend =
+        resolveCudaFftBackendForSubsystem(CudaFftSubsystem::PsfBank, requestedFftBackend, fftPolicy, nullptr);
+    const CudaFftBackend fieldRequestedFftBackend =
+        resolveCudaFftBackendForSubsystem(CudaFftSubsystem::FieldRender, requestedFftBackend, fftPolicy, nullptr);
     const bool nonFieldExecution = !HasLensDiffFieldPhase(params);
     const bool persistentKernelCacheEnabled = nonFieldExecution || LensDiffCudaPersistentKernelCacheEnabled();
     const bool persistentPlanRepositoryEnabled = nonFieldExecution || LensDiffCudaPersistentPlanRepositoryEnabled();
@@ -4185,6 +4677,12 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
     PersistentCudaPlanRepository* planRepository = persistentPlanRepositoryEnabled ? &persistentCudaPlanRepository() : nullptr;
     timing.validationEnabled = validateField;
     timing.fieldWeightSpace = useFrameWeightSpace ? "frame" : "working";
+    timing.fftPolicy = cudaFftPolicyName(fftPolicy);
+    timing.fftRequested = cudaFftBackendName(requestedFftBackend);
+    timing.fftEffective.clear();
+    timing.globalFft.requested = cudaFftBackendName(globalRequestedFftBackend);
+    timing.psfFft.requested = cudaFftBackendName(psfRequestedFftBackend);
+    timing.fieldFft.requested = cudaFftBackendName(fieldRequestedFftBackend);
     auto timeCall = [&](double& accumulator, auto&& fn) {
         const auto start = std::chrono::steady_clock::now();
         auto result = fn();
@@ -4200,7 +4698,17 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         LogLensDiffTimingStage(
             "cuda-stage-psf-bank",
             timing.psfBankMs,
-            "legacy=" + std::to_string(legacyPipeline ? 1 : 0));
+            "legacy=" + std::to_string(legacyPipeline ? 1 : 0) +
+                ",policy=" + timing.fftPolicy +
+                ",requested=" + timing.psfFft.requested +
+                ",effective=" + timing.psfFft.effective +
+                ",cufftPlanHits=" + std::to_string(timing.psfFft.cufftPlanCacheHits) +
+                ",cufftPlanMisses=" + std::to_string(timing.psfFft.cufftPlanCacheMisses) +
+                ",vkfftPlanHits=" + std::to_string(timing.psfFft.vkfftPlanCacheHits) +
+                ",vkfftPlanMisses=" + std::to_string(timing.psfFft.vkfftPlanCacheMisses) +
+                ",vkfftInitMs=" + std::to_string(timing.psfFft.vkfftCompileInitMs) +
+                ",maxWorkBytes=" + std::to_string(static_cast<unsigned long long>(timing.psfFft.maxPlanWorkBytes)) +
+                (timing.psfFft.fallback.empty() ? std::string() : ",fallback=" + timing.psfFft.fallback));
         LogLensDiffTimingStage(
             "cuda-stage-source-fft",
             timing.sourceFftMs,
@@ -4213,9 +4721,16 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             timing.kernelFftMs,
             "hits=" + std::to_string(timing.kernelCacheHits) +
                 ",misses=" + std::to_string(timing.kernelCacheMisses) +
-                ",planHits=" + std::to_string(timing.planCacheHits) +
-                ",planMisses=" + std::to_string(timing.planCacheMisses) +
-                ",maxWorkBytes=" + std::to_string(static_cast<unsigned long long>(timing.maxPlanWorkBytes)));
+                ",cufftPlanHits=" + std::to_string(timing.cufftPlanCacheHits) +
+                ",cufftPlanMisses=" + std::to_string(timing.cufftPlanCacheMisses) +
+                ",vkfftPlanHits=" + std::to_string(timing.vkfftPlanCacheHits) +
+                ",vkfftPlanMisses=" + std::to_string(timing.vkfftPlanCacheMisses) +
+                ",vkfftInitMs=" + std::to_string(timing.vkfftCompileInitMs) +
+                ",maxWorkBytes=" + std::to_string(static_cast<unsigned long long>(timing.maxPlanWorkBytes)) +
+                ",policy=" + timing.fftPolicy +
+                ",requested=" + timing.globalFft.requested +
+                ",effective=" + timing.globalFft.effective +
+                (timing.globalFft.fallback.empty() ? std::string() : ",fallback=" + timing.globalFft.fallback));
         LogLensDiffTimingStage("cuda-stage-convolution", timing.convolutionMs);
         LogLensDiffTimingStage(
             "cuda-stage-field-zones",
@@ -4225,6 +4740,16 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                 ",hostSyncs=" + std::to_string(timing.hostSyncCount) +
                 ",branch=" + timing.fieldBranch +
                 ",weightSpace=" + timing.fieldWeightSpace +
+                ",policy=" + timing.fftPolicy +
+                ",requested=" + timing.fieldFft.requested +
+                ",effective=" + timing.fieldFft.effective +
+                ",cufftPlanHits=" + std::to_string(timing.fieldFft.cufftPlanCacheHits) +
+                ",cufftPlanMisses=" + std::to_string(timing.fieldFft.cufftPlanCacheMisses) +
+                ",vkfftPlanHits=" + std::to_string(timing.fieldFft.vkfftPlanCacheHits) +
+                ",vkfftPlanMisses=" + std::to_string(timing.fieldFft.vkfftPlanCacheMisses) +
+                ",vkfftInitMs=" + std::to_string(timing.fieldFft.vkfftCompileInitMs) +
+                ",maxWorkBytes=" + std::to_string(static_cast<unsigned long long>(timing.fieldFft.maxPlanWorkBytes)) +
+                (timing.fieldFft.fallback.empty() ? std::string() : ",fallback=" + timing.fieldFft.fallback) +
                 ",fieldKeyHash=" + std::to_string(static_cast<unsigned long long>(timing.fieldKeyHash)) +
                 ",psfKeyHash=" + std::to_string(static_cast<unsigned long long>(timing.psfKeyHash)) +
                 ",scratchEstimate=" + std::to_string(static_cast<unsigned long long>(timing.fieldScratchEstimateBytes)) +
@@ -4247,7 +4772,7 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         }
     };
     if (!timeCall(timing.psfBankMs, [&] {
-            return ensurePsfBankCuda(params, cache, stream, error);
+            return ensurePsfBankCuda(params, cache, fftPolicy, requestedFftBackend, vkfftStrict, &timing, stream, error);
         })) {
         return false;
     }
@@ -4460,12 +4985,20 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
     std::unordered_map<std::string, SpectralPlaneSet> spectralPlaneScratchCache;
     std::unordered_map<std::string, DeviceBuffer<cufftComplex>> fieldRgbTripletSpectrumCache;
     const FieldZoneBatchPlan fieldPlan = buildFieldZoneBatchPlan(cache);
-    auto sourceSpectrumCacheKey = [&](const void* ptr, int paddedWidth, int paddedHeight, int channels) {
-        return std::to_string(reinterpret_cast<std::uintptr_t>(ptr)) + ":" +
+    const std::string globalCacheNamespace = cudaFftCacheNamespace(CudaFftSubsystem::GlobalRender, globalRequestedFftBackend);
+    const std::string fieldCacheNamespace = cudaFftCacheNamespace(CudaFftSubsystem::FieldRender, fieldRequestedFftBackend);
+    auto sourceSpectrumCacheKey = [&](const std::string& cacheNamespace,
+                                      const void* ptr,
+                                      int paddedWidth,
+                                      int paddedHeight,
+                                      int channels) {
+        return cacheNamespace + ":" +
+               std::to_string(reinterpret_cast<std::uintptr_t>(ptr)) + ":" +
                std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) +
                ":" + std::to_string(channels);
     };
-    auto windowSourceSpectrumCacheKey = [&](const void* ptr,
+    auto windowSourceSpectrumCacheKey = [&](const std::string& cacheNamespace,
+                                            const void* ptr,
                                             int windowX,
                                             int windowY,
                                             int windowWidth,
@@ -4473,14 +5006,19 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                                             int paddedWidth,
                                             int paddedHeight,
                                             int channels) {
-        return std::to_string(reinterpret_cast<std::uintptr_t>(ptr)) + ":" +
+        return cacheNamespace + ":" +
+               std::to_string(reinterpret_cast<std::uintptr_t>(ptr)) + ":" +
                std::to_string(windowX) + "," + std::to_string(windowY) + "," +
                std::to_string(windowWidth) + "x" + std::to_string(windowHeight) + ":" +
                std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) + ":" +
                std::to_string(channels);
     };
-    auto kernelSpectrumCacheKey = [&](const LensDiffKernel& kernel, int paddedWidth, int paddedHeight) {
-        return std::to_string(reinterpret_cast<std::uintptr_t>(kernel.values.data())) + ":" +
+    auto kernelSpectrumCacheKey = [&](const std::string& cacheNamespace,
+                                      const LensDiffKernel& kernel,
+                                      int paddedWidth,
+                                      int paddedHeight) {
+        return cacheNamespace + ":" +
+               std::to_string(reinterpret_cast<std::uintptr_t>(kernel.values.data())) + ":" +
                std::to_string(kernel.size) + ":" +
                std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight);
     };
@@ -4491,7 +5029,8 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                                   int repeatPerKernel,
                                   int zoneStart,
                                   int zoneCount) {
-        return std::to_string(static_cast<unsigned long long>(timing.fieldKeyHash)) + ":" +
+        return fieldCacheNamespace + ":" +
+                std::to_string(static_cast<unsigned long long>(timing.fieldKeyHash)) + ":" +
                 std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) + ":" +
                 std::to_string(static_cast<int>(effectKind)) + ":" +
                 std::to_string(binCount) + ":" + std::to_string(repeatPerKernel) + ":" +
@@ -4505,8 +5044,50 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                          planeCount * static_cast<std::uint64_t>(sizeof(float)));
     };
     constexpr std::uint64_t kFieldStackBudgetBytes = 1536ULL * 1024ULL * 1024ULL;
-    auto getPlanForDims = [&](int paddedWidth, int paddedHeight, int batchCount, CudaPlanLease* outPlan) -> bool {
-        return acquirePlan(planRepository, paddedWidth, paddedHeight, batchCount, stream, &timing, outPlan, error);
+    auto getPlanForDimsFor = [&](CudaFftSubsystem subsystem,
+                                 int paddedWidth,
+                                 int paddedHeight,
+                                 int batchCount,
+                                 CudaFftPlanLease* outPlan) -> bool {
+        const CudaFftBackend subsystemBackend =
+            subsystem == CudaFftSubsystem::PsfBank ? psfRequestedFftBackend :
+            (subsystem == CudaFftSubsystem::FieldRender ? fieldRequestedFftBackend : globalRequestedFftBackend);
+        return acquireFftPlan(subsystem,
+                              subsystemBackend,
+                              vkfftStrict,
+                              planRepository,
+                              usePersistentVkfftRepositoryForSubsystem(subsystem, fftPolicy, persistentPlanRepositoryEnabled),
+                              paddedWidth,
+                              paddedHeight,
+                              batchCount,
+                              stream,
+                              &timing,
+                              outPlan,
+                              error);
+    };
+    auto getPlanForDims = [&](int paddedWidth, int paddedHeight, int batchCount, CudaFftPlanLease* outPlan) -> bool {
+        return getPlanForDimsFor(CudaFftSubsystem::GlobalRender, paddedWidth, paddedHeight, batchCount, outPlan);
+    };
+    auto acquireDirectPlanForSubsystem = [&](CudaFftSubsystem subsystem,
+                                             int paddedWidth,
+                                             int paddedHeight,
+                                             int batchCount,
+                                             CudaFftPlanLease* outPlan) -> bool {
+        const CudaFftBackend subsystemBackend =
+            subsystem == CudaFftSubsystem::PsfBank ? psfRequestedFftBackend :
+            (subsystem == CudaFftSubsystem::FieldRender ? fieldRequestedFftBackend : globalRequestedFftBackend);
+        return acquireFftPlan(subsystem,
+                              subsystemBackend,
+                              vkfftStrict,
+                              nullptr,
+                              usePersistentVkfftRepositoryForSubsystem(subsystem, fftPolicy, persistentPlanRepositoryEnabled),
+                              paddedWidth,
+                              paddedHeight,
+                              batchCount,
+                              stream,
+                              &timing,
+                              outPlan,
+                              error);
     };
     auto getComplexScratch = [&](const std::string& key,
                                  std::size_t elementCount,
@@ -4581,14 +5162,16 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         *outSet = &it->second;
         return true;
     };
-    auto getScalarSourceSpectrum = [&](const DeviceBuffer<float>& source,
-                                       int paddedWidth,
-                                       int paddedHeight,
-                                       DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
+    auto getScalarSourceSpectrumFor = [&](CudaFftSubsystem subsystem,
+                                          const std::string& cacheNamespace,
+                                          const DeviceBuffer<float>& source,
+                                          int paddedWidth,
+                                          int paddedHeight,
+                                          DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
         if (outSpectrum == nullptr) {
             return false;
         }
-        const std::string key = sourceSpectrumCacheKey(source.ptr, paddedWidth, paddedHeight, 1);
+        const std::string key = sourceSpectrumCacheKey(cacheNamespace, source.ptr, paddedWidth, paddedHeight, 1);
         auto it = scalarSourceSpectrumCache.find(key);
         if (it != scalarSourceSpectrumCache.end()) {
             ++timing.scalarSourceCacheHits;
@@ -4596,11 +5179,87 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             return true;
         }
         ++timing.scalarSourceCacheMisses;
-        CudaPlanLease plan;
+        CudaFftPlanLease plan;
         DeviceBuffer<cufftComplex> spectrum;
-        if (!getPlanForDims(paddedWidth, paddedHeight, 1, &plan) ||
+        if (!getPlanForDimsFor(subsystem, paddedWidth, paddedHeight, 1, &plan) ||
             !timeCall(timing.sourceFftMs, [&] {
-                return makeImageSpectrum(source.ptr, width, height, paddedWidth, paddedHeight, plan.handle(), stream, spectrum, error);
+                return makeImageSpectrum(source.ptr, subsystem, width, height, paddedWidth, paddedHeight, &plan, stream, &timing, spectrum, error);
+            })) {
+            return false;
+        }
+        auto insert = scalarSourceSpectrumCache.emplace(key, std::move(spectrum));
+        *outSpectrum = &insert.first->second;
+        return true;
+    };
+    auto getScalarSourceSpectrum = [&](const DeviceBuffer<float>& source,
+                                       int paddedWidth,
+                                       int paddedHeight,
+                                       DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
+        return getScalarSourceSpectrumFor(CudaFftSubsystem::GlobalRender,
+                                          globalCacheNamespace,
+                                          source,
+                                          paddedWidth,
+                                          paddedHeight,
+                                          outSpectrum);
+    };
+    auto getFieldScalarSourceSpectrum = [&](const DeviceBuffer<float>& source,
+                                            int paddedWidth,
+                                            int paddedHeight,
+                                            DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
+        return getScalarSourceSpectrumFor(CudaFftSubsystem::FieldRender,
+                                          fieldCacheNamespace,
+                                          source,
+                                          paddedWidth,
+                                          paddedHeight,
+                                          outSpectrum);
+    };
+    auto getScalarSourceSpectrumWindowFor = [&](CudaFftSubsystem subsystem,
+                                                const std::string& cacheNamespace,
+                                                const DeviceBuffer<float>& source,
+                                                int windowX,
+                                                int windowY,
+                                                int windowWidth,
+                                                int windowHeight,
+                                                int paddedWidth,
+                                                int paddedHeight,
+                                                DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
+        if (outSpectrum == nullptr) {
+            return false;
+        }
+        const std::string key = windowSourceSpectrumCacheKey(cacheNamespace,
+                                                             source.ptr,
+                                                             windowX,
+                                                             windowY,
+                                                             windowWidth,
+                                                             windowHeight,
+                                                             paddedWidth,
+                                                             paddedHeight,
+                                                             1);
+        auto it = scalarSourceSpectrumCache.find(key);
+        if (it != scalarSourceSpectrumCache.end()) {
+            ++timing.scalarSourceCacheHits;
+            *outSpectrum = &it->second;
+            return true;
+        }
+        ++timing.scalarSourceCacheMisses;
+        CudaFftPlanLease plan;
+        DeviceBuffer<cufftComplex> spectrum;
+        if (!getPlanForDimsFor(subsystem, paddedWidth, paddedHeight, 1, &plan) ||
+            !timeCall(timing.sourceFftMs, [&] {
+                return makeImageSpectrumWindow(source.ptr,
+                                               width,
+                                               height,
+                                               windowX,
+                                               windowY,
+                                               windowWidth,
+                                               windowHeight,
+                                               paddedWidth,
+                                               paddedHeight,
+                                               &plan,
+                                               stream,
+                                               &timing,
+                                               spectrum,
+                                               error);
             })) {
             return false;
         }
@@ -4616,56 +5275,46 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                                              int paddedWidth,
                                              int paddedHeight,
                                              DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
-        if (outSpectrum == nullptr) {
-            return false;
-        }
-        const std::string key = windowSourceSpectrumCacheKey(source.ptr,
-                                                             windowX,
-                                                             windowY,
-                                                             windowWidth,
-                                                             windowHeight,
-                                                             paddedWidth,
-                                                             paddedHeight,
-                                                             1);
-        auto it = scalarSourceSpectrumCache.find(key);
-        if (it != scalarSourceSpectrumCache.end()) {
-            ++timing.scalarSourceCacheHits;
-            *outSpectrum = &it->second;
-            return true;
-        }
-        ++timing.scalarSourceCacheMisses;
-        CudaPlanLease plan;
-        DeviceBuffer<cufftComplex> spectrum;
-        if (!getPlanForDims(paddedWidth, paddedHeight, 1, &plan) ||
-            !timeCall(timing.sourceFftMs, [&] {
-                return makeImageSpectrumWindow(source.ptr,
-                                               width,
-                                               height,
-                                               windowX,
-                                               windowY,
-                                               windowWidth,
-                                               windowHeight,
-                                               paddedWidth,
-                                               paddedHeight,
-                                               plan.handle(),
-                                               stream,
-                                               spectrum,
-                                               error);
-            })) {
-            return false;
-        }
-        auto insert = scalarSourceSpectrumCache.emplace(key, std::move(spectrum));
-        *outSpectrum = &insert.first->second;
-        return true;
+        return getScalarSourceSpectrumWindowFor(CudaFftSubsystem::GlobalRender,
+                                                globalCacheNamespace,
+                                                source,
+                                                windowX,
+                                                windowY,
+                                                windowWidth,
+                                                windowHeight,
+                                                paddedWidth,
+                                                paddedHeight,
+                                                outSpectrum);
     };
-    auto getKernelSpectrum = [&](const LensDiffKernel& kernel,
-                                 int paddedWidth,
-                                 int paddedHeight,
-                                 DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
+    auto getFieldScalarSourceSpectrumWindow = [&](const DeviceBuffer<float>& source,
+                                                  int windowX,
+                                                  int windowY,
+                                                  int windowWidth,
+                                                  int windowHeight,
+                                                  int paddedWidth,
+                                                  int paddedHeight,
+                                                  DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
+        return getScalarSourceSpectrumWindowFor(CudaFftSubsystem::FieldRender,
+                                                fieldCacheNamespace,
+                                                source,
+                                                windowX,
+                                                windowY,
+                                                windowWidth,
+                                                windowHeight,
+                                                paddedWidth,
+                                                paddedHeight,
+                                                outSpectrum);
+    };
+    auto getKernelSpectrumFor = [&](CudaFftSubsystem subsystem,
+                                    const std::string& cacheNamespace,
+                                    const LensDiffKernel& kernel,
+                                    int paddedWidth,
+                                    int paddedHeight,
+                                    DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
         if (outSpectrum == nullptr) {
             return false;
         }
-        const std::string key = kernelSpectrumCacheKey(kernel, paddedWidth, paddedHeight);
+        const std::string key = kernelSpectrumCacheKey(cacheNamespace, kernel, paddedWidth, paddedHeight);
         auto it = kernelSpectrumCache.find(key);
         if (it != kernelSpectrumCache.end()) {
             ++timing.kernelCacheHits;
@@ -4677,7 +5326,7 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             return false;
         }
         const std::string persistentKey =
-            persistentKernelSpectrumCacheKey(currentDevice, kernel, paddedWidth, paddedHeight);
+            persistentKernelSpectrumCacheKey(cacheNamespace, currentDevice, kernel, paddedWidth, paddedHeight);
         if (persistentKernelCacheEnabled) {
             auto& persistentCache = persistentCudaKernelSpectrumCache();
             std::lock_guard<std::mutex> lock(persistentCache.mutex);
@@ -4699,13 +5348,13 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             }
         }
         ++timing.kernelCacheMisses;
-        CudaPlanLease plan;
+        CudaFftPlanLease plan;
         DeviceBuffer<float> deviceKernel;
         DeviceBuffer<cufftComplex> spectrum;
         std::shared_ptr<DeviceBuffer<cufftComplex>> sharedSpectrum;
-        if (!getPlanForDims(paddedWidth, paddedHeight, 1, &plan) ||
+        if (!getPlanForDimsFor(subsystem, paddedWidth, paddedHeight, 1, &plan) ||
             !timeCall(timing.kernelFftMs, [&] {
-                return makeKernelSpectrum(kernel, paddedWidth, paddedHeight, plan.handle(), stream, deviceKernel, spectrum, error);
+                return makeKernelSpectrum(kernel, subsystem, paddedWidth, paddedHeight, &plan, stream, &timing, deviceKernel, spectrum, error);
             })) {
             return false;
         }
@@ -4757,14 +5406,38 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         *outSpectrum = insert.first->second.get();
         return true;
     };
-    auto getRgbPlaneSpectrum = [&](const DeviceBuffer<float>& source,
-                                   int paddedWidth,
-                                   int paddedHeight,
-                                   DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
+    auto getKernelSpectrum = [&](const LensDiffKernel& kernel,
+                                 int paddedWidth,
+                                 int paddedHeight,
+                                 DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
+        return getKernelSpectrumFor(CudaFftSubsystem::GlobalRender,
+                                    globalCacheNamespace,
+                                    kernel,
+                                    paddedWidth,
+                                    paddedHeight,
+                                    outSpectrum);
+    };
+    auto getFieldKernelSpectrum = [&](const LensDiffKernel& kernel,
+                                      int paddedWidth,
+                                      int paddedHeight,
+                                      DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
+        return getKernelSpectrumFor(CudaFftSubsystem::FieldRender,
+                                    fieldCacheNamespace,
+                                    kernel,
+                                    paddedWidth,
+                                    paddedHeight,
+                                    outSpectrum);
+    };
+    auto getRgbPlaneSpectrumFor = [&](CudaFftSubsystem subsystem,
+                                      const std::string& cacheNamespace,
+                                      const DeviceBuffer<float>& source,
+                                      int paddedWidth,
+                                      int paddedHeight,
+                                      DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
         if (outSpectrum == nullptr) {
             return false;
         }
-        const std::string key = sourceSpectrumCacheKey(source.ptr, paddedWidth, paddedHeight, 3);
+        const std::string key = sourceSpectrumCacheKey(cacheNamespace, source.ptr, paddedWidth, paddedHeight, 3);
         auto it = rgbSourceSpectrumCache.find(key);
         if (it != rgbSourceSpectrumCache.end()) {
             ++timing.rgbSourceCacheHits;
@@ -4772,17 +5445,39 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             return true;
         }
         ++timing.rgbSourceCacheMisses;
-        CudaPlanLease plan;
+        CudaFftPlanLease plan;
         DeviceBuffer<cufftComplex> spectrum;
-        if (!getPlanForDims(paddedWidth, paddedHeight, 1, &plan) ||
+        if (!getPlanForDimsFor(subsystem, paddedWidth, paddedHeight, 1, &plan) ||
             !timeCall(timing.sourceFftMs, [&] {
-                return makeImageSpectrum(source.ptr, width, height, paddedWidth, paddedHeight, plan.handle(), stream, spectrum, error);
+                return makeImageSpectrum(source.ptr, subsystem, width, height, paddedWidth, paddedHeight, &plan, stream, &timing, spectrum, error);
             })) {
             return false;
         }
         auto insert = rgbSourceSpectrumCache.emplace(key, std::move(spectrum));
         *outSpectrum = &insert.first->second;
         return true;
+    };
+    auto getRgbPlaneSpectrum = [&](const DeviceBuffer<float>& source,
+                                   int paddedWidth,
+                                   int paddedHeight,
+                                   DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
+        return getRgbPlaneSpectrumFor(CudaFftSubsystem::GlobalRender,
+                                      globalCacheNamespace,
+                                      source,
+                                      paddedWidth,
+                                      paddedHeight,
+                                      outSpectrum);
+    };
+    auto getFieldRgbPlaneSpectrum = [&](const DeviceBuffer<float>& source,
+                                        int paddedWidth,
+                                        int paddedHeight,
+                                        DeviceBuffer<cufftComplex>** outSpectrum) -> bool {
+        return getRgbPlaneSpectrumFor(CudaFftSubsystem::FieldRender,
+                                      fieldCacheNamespace,
+                                      source,
+                                      paddedWidth,
+                                      paddedHeight,
+                                      outSpectrum);
     };
 
     auto convolvePlaneSet = [&](const DeviceBuffer<float>& srcRPlane,
@@ -4793,7 +5488,7 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                                 const char* stagePrefix) -> bool {
         const int paddedWidth = nextPowerOfTwo(width + kernel.size - 1);
         const int paddedHeight = nextPowerOfTwo(height + kernel.size - 1);
-        CudaPlanLease plan;
+        CudaFftPlanLease plan;
         DeviceBuffer<cufftComplex> tempSpectrum;
         DeviceBuffer<cufftComplex>* imageSpecR = nullptr;
         DeviceBuffer<cufftComplex>* imageSpecG = nullptr;
@@ -4804,9 +5499,9 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                         getRgbPlaneSpectrum(srcGPlane, paddedWidth, paddedHeight, &imageSpecG) &&
                         getRgbPlaneSpectrum(srcBPlane, paddedWidth, paddedHeight, &imageSpecB) &&
                         getKernelSpectrum(kernel, paddedWidth, paddedHeight, &kernelSpec) &&
-                        convolveSpectrumToPlane(*imageSpecR, *kernelSpec, width, height, paddedWidth, paddedHeight, plan.handle(), stream, tempSpectrum, dst.r, error) &&
-                        convolveSpectrumToPlane(*imageSpecG, *kernelSpec, width, height, paddedWidth, paddedHeight, plan.handle(), stream, tempSpectrum, dst.g, error) &&
-                        convolveSpectrumToPlane(*imageSpecB, *kernelSpec, width, height, paddedWidth, paddedHeight, plan.handle(), stream, tempSpectrum, dst.b, error);
+                        convolveSpectrumToPlane(*imageSpecR, *kernelSpec, CudaFftSubsystem::GlobalRender, width, height, paddedWidth, paddedHeight, &plan, stream, &timing, tempSpectrum, dst.r, error) &&
+                        convolveSpectrumToPlane(*imageSpecG, *kernelSpec, CudaFftSubsystem::GlobalRender, width, height, paddedWidth, paddedHeight, &plan, stream, &timing, tempSpectrum, dst.g, error) &&
+                        convolveSpectrumToPlane(*imageSpecB, *kernelSpec, CudaFftSubsystem::GlobalRender, width, height, paddedWidth, paddedHeight, &plan, stream, &timing, tempSpectrum, dst.b, error);
         if (!ok && error && error->empty()) {
             *error = stagePrefix;
         }
@@ -4880,7 +5575,7 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         const LensDiffSpectrumConfig zoneSpectrumConfig = BuildLensDiffSpectrumConfig(params, bins);
         const int paddedWidth = nextPowerOfTwo(width + bins.front().full.size - 1);
         const int paddedHeight = nextPowerOfTwo(height + bins.front().full.size - 1);
-        CudaPlanLease plan;
+        CudaFftPlanLease plan;
         DeviceBuffer<cufftComplex> tempSpectrum;
         DeviceBuffer<cufftComplex>* driverSpectrum = nullptr;
         SpectralPlaneSet fullBins;
@@ -4906,15 +5601,17 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                     !timeCall(timing.convolutionMs, [&] {
                         return convolveSpectrumToPlane(*driverSpectrum,
                                              *kernelSpectrum,
+                                             CudaFftSubsystem::GlobalRender,
                                              width,
                                              height,
                                              paddedWidth,
                                              paddedHeight,
-                                              plan.handle(),
-                                             stream,
-                                             tempSpectrum,
-                                             dst.bins[static_cast<std::size_t>(i)],
-                                             error);
+                                              &plan,
+                                              stream,
+                                              &timing,
+                                              tempSpectrum,
+                                              dst.bins[static_cast<std::size_t>(i)],
+                                              error);
                     })) {
                     return false;
                 }
@@ -5072,7 +5769,7 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             for (int binIndex = 0; binIndex < binCount; ++binIndex) {
                 DeviceBuffer<cufftComplex>* kernelSpectrum = nullptr;
                 if (zone == nullptr ||
-                    !getKernelSpectrum(kernelForEffect(zone->bins[static_cast<std::size_t>(binIndex)], effectKind),
+                    !getFieldKernelSpectrum(kernelForEffect(zone->bins[static_cast<std::size_t>(binIndex)], effectKind),
                                        paddedWidth,
                                        paddedHeight,
                                        &kernelSpectrum)) {
@@ -5147,7 +5844,7 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             if (error) *error = "cuda-null-rgb-triplet-stack";
             return false;
         }
-        const std::string key = "field-rgb-triplet:" + std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight);
+        const std::string key = fieldCacheNamespace + ":field-rgb-triplet:" + std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight);
         auto it = fieldRgbTripletSpectrumCache.find(key);
         if (it != fieldRgbTripletSpectrumCache.end()) {
             *outStack = &it->second;
@@ -5156,9 +5853,9 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         DeviceBuffer<cufftComplex>* srcR = nullptr;
         DeviceBuffer<cufftComplex>* srcG = nullptr;
         DeviceBuffer<cufftComplex>* srcB = nullptr;
-        if (!getRgbPlaneSpectrum(redistributedR, paddedWidth, paddedHeight, &srcR) ||
-            !getRgbPlaneSpectrum(redistributedG, paddedWidth, paddedHeight, &srcG) ||
-            !getRgbPlaneSpectrum(redistributedB, paddedWidth, paddedHeight, &srcB)) {
+        if (!getFieldRgbPlaneSpectrum(redistributedR, paddedWidth, paddedHeight, &srcR) ||
+            !getFieldRgbPlaneSpectrum(redistributedG, paddedWidth, paddedHeight, &srcG) ||
+            !getFieldRgbPlaneSpectrum(redistributedB, paddedWidth, paddedHeight, &srcB)) {
             return false;
         }
         const std::size_t paddedCount = static_cast<std::size_t>(paddedWidth) * paddedHeight;
@@ -5326,7 +6023,7 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                 const std::size_t patchPixelCount = static_cast<std::size_t>(patchWidth) * patchHeight;
                 const std::size_t paddedCount = static_cast<std::size_t>(paddedWidth) * paddedHeight;
                 DeviceBuffer<cufftComplex>* driverSpectrum = nullptr;
-                if (!getScalarSourceSpectrumWindow(redistributedDriver,
+                if (!getFieldScalarSourceSpectrumWindow(redistributedDriver,
                                                   patchX,
                                                   patchY,
                                                   patchWidth,
@@ -5341,7 +6038,7 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                     DeviceBuffer<cufftComplex>* sourceStack = nullptr;
                     DeviceBuffer<cufftComplex>* kernelStack = nullptr;
                     if (!getReplicatedSpectrumStack(*driverSpectrum,
-                                                    "field-driver-tile:" + std::to_string(patchX) + "," + std::to_string(patchY) +
+                                        fieldCacheNamespace + ":field-driver-tile:" + std::to_string(patchX) + "," + std::to_string(patchY) +
                                                         ":" + std::to_string(patchWidth) + "x" + std::to_string(patchHeight) + ":" +
                                                         std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) + ":" +
                                                         std::to_string(activeZoneCount * binCount),
@@ -5360,8 +6057,12 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                                                        &kernelStack)) {
                         return false;
                     }
-                    CudaPlanLease plan;
-                    if (!getPlanForDims(paddedWidth, paddedHeight, activeZoneCount * binCount, &plan)) {
+                    CudaFftPlanLease plan;
+                    if (!getPlanForDimsFor(CudaFftSubsystem::FieldRender,
+                                           paddedWidth,
+                                           paddedHeight,
+                                           activeZoneCount * binCount,
+                                           &plan)) {
                         return false;
                     }
                     DeviceBuffer<cufftComplex>* tempSpectrum = nullptr;
@@ -5380,15 +6081,17 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                     if (!timeCall(timing.convolutionMs, [&] {
                             return convolveSpectrumStackToPlaneStack(*sourceStack,
                                                                      *kernelStack,
+                                                                     CudaFftSubsystem::FieldRender,
                                                                      patchWidth,
                                                                      patchHeight,
                                                                      paddedWidth,
                                                                      paddedHeight,
                                                                      activeZoneCount * binCount,
-                                                                     plan.handle(),
+                                                                     &plan,
                                                                      stream,
                                                                      *tempSpectrum,
                                                                      *planeStack,
+                                                                     &timing,
                                                                      error);
                         })) {
                         return false;
@@ -5488,9 +6191,9 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         DeviceBuffer<cufftComplex>* driverSpectrum = nullptr;
         DeviceBuffer<cufftComplex>* sourceStack = nullptr;
         DeviceBuffer<cufftComplex>* kernelStack = nullptr;
-        if (!getScalarSourceSpectrum(redistributedDriver, paddedWidth, paddedHeight, &driverSpectrum) ||
+        if (!getFieldScalarSourceSpectrum(redistributedDriver, paddedWidth, paddedHeight, &driverSpectrum) ||
             !getReplicatedSpectrumStack(*driverSpectrum,
-                                        "field-driver:" + std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) +
+                                        fieldCacheNamespace + ":field-driver:" + std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) +
                                             ":" + std::to_string(zoneCount * binCount),
                                         1,
                                         zoneCount * binCount,
@@ -5501,8 +6204,8 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             return false;
         }
 
-        CudaPlanLease plan;
-        if (!getPlanForDims(paddedWidth, paddedHeight, zoneCount * binCount, &plan)) {
+        CudaFftPlanLease plan;
+        if (!getPlanForDimsFor(CudaFftSubsystem::FieldRender, paddedWidth, paddedHeight, zoneCount * binCount, &plan)) {
             return false;
         }
         DeviceBuffer<cufftComplex>* tempSpectrum = nullptr;
@@ -5522,15 +6225,17 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         if (!timeCall(timing.convolutionMs, [&] {
                 return convolveSpectrumStackToPlaneStack(*sourceStack,
                                                          *kernelStack,
+                                                         CudaFftSubsystem::FieldRender,
                                                          width,
                                                          height,
                                                          paddedWidth,
                                                          paddedHeight,
                                                          zoneCount * binCount,
-                                                         plan.handle(),
+                                                         &plan,
                                                          stream,
                                                          *tempSpectrum,
                                                          *planeStack,
+                                                         &timing,
                                                          error);
             })) {
             return false;
@@ -5627,7 +6332,7 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         const int paddedWidth = nextPowerOfTwo(width + maxKernelSize - 1);
         const int paddedHeight = nextPowerOfTwo(height + maxKernelSize - 1);
         DeviceBuffer<cufftComplex>* driverSpectrum = nullptr;
-        if (!getScalarSourceSpectrum(redistributedDriver, paddedWidth, paddedHeight, &driverSpectrum)) {
+        if (!getFieldScalarSourceSpectrum(redistributedDriver, paddedWidth, paddedHeight, &driverSpectrum)) {
             return false;
         }
         SpectralPlaneSet* weightedPlanes = nullptr;
@@ -5678,8 +6383,12 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                                                &kernelStack)) {
                 return false;
             }
-            CudaPlanLease plan;
-            if (!getPlanForDims(paddedWidth, paddedHeight, activeZoneCount * binCount, &plan)) {
+            CudaFftPlanLease plan;
+            if (!getPlanForDimsFor(CudaFftSubsystem::FieldRender,
+                                   paddedWidth,
+                                   paddedHeight,
+                                   activeZoneCount * binCount,
+                                   &plan)) {
                 return false;
             }
             DeviceBuffer<cufftComplex>* tempSpectrum = nullptr;
@@ -5698,15 +6407,17 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             if (!timeCall(timing.convolutionMs, [&] {
                     return convolveSpectrumStackToPlaneStack(*sourceStack,
                                                              *kernelStack,
+                                                             CudaFftSubsystem::FieldRender,
                                                              width,
                                                              height,
                                                              paddedWidth,
                                                              paddedHeight,
                                                              activeZoneCount * binCount,
-                                                             plan.handle(),
+                                                             &plan,
                                                              stream,
                                                              *tempSpectrum,
                                                              *planeStack,
+                                                             &timing,
                                                              error);
                 })) {
                 return false;
@@ -5907,7 +6618,7 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         DeviceBuffer<cufftComplex>* kernelStack = nullptr;
         if (!getRgbTripletSpectrumStack(paddedWidth, paddedHeight, &rgbTripletSpectrum) ||
             !getReplicatedSpectrumStack(*rgbTripletSpectrum,
-                                        "field-rgb-triplet-replicated:" + std::to_string(paddedWidth) + "x" +
+                                            fieldCacheNamespace + ":field-rgb-triplet-replicated:" + std::to_string(paddedWidth) + "x" +
                                             std::to_string(paddedHeight) + ":" + std::to_string(zoneCount * 3),
                                         3,
                                         zoneCount * 3,
@@ -5919,8 +6630,8 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         if (!buildFieldKernelSpectrumStack(effectKind, paddedWidth, paddedHeight, 1, 3, 0, zoneCount, &kernelStack)) {
             return false;
         }
-        CudaPlanLease plan;
-        if (!getPlanForDims(paddedWidth, paddedHeight, zoneCount * 3, &plan)) {
+        CudaFftPlanLease plan;
+        if (!getPlanForDimsFor(CudaFftSubsystem::FieldRender, paddedWidth, paddedHeight, zoneCount * 3, &plan)) {
             return false;
         }
         const std::size_t paddedCount = static_cast<std::size_t>(paddedWidth) * paddedHeight;
@@ -5939,16 +6650,18 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         if (!timeCall(timing.convolutionMs, [&] {
                 return convolveSpectrumStackToPlaneStack(*sourceStack,
                                                          *kernelStack,
+                                                         CudaFftSubsystem::FieldRender,
                                                          width,
                                                          height,
                                                          paddedWidth,
                                                          paddedHeight,
                                                          zoneCount * 3,
-                                                          plan.handle(),
-                                                         stream,
-                                                         *tempSpectrum,
-                                                         *planeStack,
-                                                         error);
+                                                          &plan,
+                                                          stream,
+                                                          *tempSpectrum,
+                                                          *planeStack,
+                                                          &timing,
+                                                          error);
             })) {
             return false;
         }
@@ -5961,34 +6674,34 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                                       const DeviceBuffer<float>& srcGPlane,
                                       const DeviceBuffer<float>& srcBPlane,
                                       const LensDiffKernel& kernel,
+                                      CudaFftSubsystem subsystem,
                                       PlaneSet& dst,
                                       const char* stagePrefix) -> bool {
         const int paddedWidth = nextPowerOfTwo(width + kernel.size - 1);
         const int paddedHeight = nextPowerOfTwo(height + kernel.size - 1);
-        cufftHandle plan = 0;
+        CudaFftPlanLease plan;
         DeviceBuffer<cufftComplex> tempSpectrum;
         DeviceBuffer<cufftComplex> imageSpecR;
         DeviceBuffer<cufftComplex> imageSpecG;
         DeviceBuffer<cufftComplex> imageSpecB;
         DeviceBuffer<cufftComplex> kernelSpec;
         DeviceBuffer<float> deviceKernel;
-        if (!createPlan(&plan, paddedWidth, paddedHeight, stream, error)) {
-            return false;
-        }
-        const bool ok = makeImageSpectrum(srcRPlane.ptr, width, height, paddedWidth, paddedHeight, plan, stream, imageSpecR, error) &&
-                        makeImageSpectrum(srcGPlane.ptr, width, height, paddedWidth, paddedHeight, plan, stream, imageSpecG, error) &&
-                        makeImageSpectrum(srcBPlane.ptr, width, height, paddedWidth, paddedHeight, plan, stream, imageSpecB, error) &&
-                        makeKernelSpectrum(kernel, paddedWidth, paddedHeight, plan, stream, deviceKernel, kernelSpec, error) &&
-                        convolveSpectrumToPlane(imageSpecR, kernelSpec, width, height, paddedWidth, paddedHeight, plan, stream, tempSpectrum, dst.r, error) &&
-                        convolveSpectrumToPlane(imageSpecG, kernelSpec, width, height, paddedWidth, paddedHeight, plan, stream, tempSpectrum, dst.g, error) &&
-                        convolveSpectrumToPlane(imageSpecB, kernelSpec, width, height, paddedWidth, paddedHeight, plan, stream, tempSpectrum, dst.b, error);
-        cufftDestroy(plan);
+        const bool ok =
+            acquireDirectPlanForSubsystem(subsystem, paddedWidth, paddedHeight, 1, &plan) &&
+            makeImageSpectrum(srcRPlane.ptr, subsystem, width, height, paddedWidth, paddedHeight, &plan, stream, &timing, imageSpecR, error) &&
+            makeImageSpectrum(srcGPlane.ptr, subsystem, width, height, paddedWidth, paddedHeight, &plan, stream, &timing, imageSpecG, error) &&
+            makeImageSpectrum(srcBPlane.ptr, subsystem, width, height, paddedWidth, paddedHeight, &plan, stream, &timing, imageSpecB, error) &&
+            makeKernelSpectrum(kernel, subsystem, paddedWidth, paddedHeight, &plan, stream, &timing, deviceKernel, kernelSpec, error) &&
+            convolveSpectrumToPlane(imageSpecR, kernelSpec, subsystem, width, height, paddedWidth, paddedHeight, &plan, stream, &timing, tempSpectrum, dst.r, error) &&
+            convolveSpectrumToPlane(imageSpecG, kernelSpec, subsystem, width, height, paddedWidth, paddedHeight, &plan, stream, &timing, tempSpectrum, dst.g, error) &&
+            convolveSpectrumToPlane(imageSpecB, kernelSpec, subsystem, width, height, paddedWidth, paddedHeight, &plan, stream, &timing, tempSpectrum, dst.b, error);
         if (!ok && error && error->empty()) {
             *error = stagePrefix;
         }
         return ok;
     };
-    auto renderFromBinsStable = [&](const std::vector<LensDiffPsfBin>& bins,
+    auto renderFromBinsStable = [&](CudaFftSubsystem subsystem,
+                                    const std::vector<LensDiffPsfBin>& bins,
                                     PlaneSet& outEffect,
                                     PlaneSet* outCore,
                                     PlaneSet* outStructure) -> bool {
@@ -6012,15 +6725,15 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             }
 
             if (!splitMode &&
-                !convolvePlaneSetStable(redistributedR, redistributedG, redistributedB, bins.front().full, fullEffect, "cuda-convolve-zone-full")) {
+                !convolvePlaneSetStable(redistributedR, redistributedG, redistributedB, bins.front().full, subsystem, fullEffect, "cuda-convolve-zone-full")) {
                 return false;
             }
             if (localNeedCore &&
-                !convolvePlaneSetStable(redistributedR, redistributedG, redistributedB, bins.front().core, *outCore, "cuda-convolve-zone-core")) {
+                !convolvePlaneSetStable(redistributedR, redistributedG, redistributedB, bins.front().core, subsystem, *outCore, "cuda-convolve-zone-core")) {
                 return false;
             }
             if (localNeedStructure &&
-                !convolvePlaneSetStable(redistributedR, redistributedG, redistributedB, bins.front().structure, *outStructure, "cuda-convolve-zone-structure")) {
+                !convolvePlaneSetStable(redistributedR, redistributedG, redistributedB, bins.front().structure, subsystem, *outStructure, "cuda-convolve-zone-structure")) {
                 return false;
             }
 
@@ -6054,11 +6767,10 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         const LensDiffSpectrumConfig zoneSpectrumConfig = BuildLensDiffSpectrumConfig(params, bins);
         const int paddedWidth = nextPowerOfTwo(width + bins.front().full.size - 1);
         const int paddedHeight = nextPowerOfTwo(height + bins.front().full.size - 1);
-        cufftHandle plan = 0;
+        CudaFftPlanLease plan;
         DeviceBuffer<cufftComplex> tempSpectrum;
         DeviceBuffer<cufftComplex> driverSpectrum;
-        DeviceBuffer<cufftComplex> tempKernelSpectrum;
-        DeviceBuffer<float> deviceKernel;
+        DeviceBuffer<float> kernelBuffer;
         SpectralPlaneSet fullBins;
         SpectralPlaneSet coreBins;
         SpectralPlaneSet structureBins;
@@ -6074,22 +6786,27 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         auto convolveBinsStable = [&](const std::vector<LensDiffKernel>& kernels, SpectralPlaneSet& dst) -> bool {
             const int activeBins = std::min<int>(static_cast<int>(kernels.size()), kLensDiffMaxSpectralBins);
             for (int i = 0; i < activeBins; ++i) {
+                DeviceBuffer<cufftComplex> tempKernelSpectrum;
                 if (!makeKernelSpectrum(kernels[static_cast<std::size_t>(i)],
+                                        subsystem,
                                         paddedWidth,
                                         paddedHeight,
-                                        plan,
+                                        &plan,
                                         stream,
-                                        deviceKernel,
+                                        &timing,
+                                        kernelBuffer,
                                         tempKernelSpectrum,
                                         error) ||
                     !convolveSpectrumToPlane(driverSpectrum,
                                              tempKernelSpectrum,
+                                             subsystem,
                                              width,
                                              height,
                                              paddedWidth,
                                              paddedHeight,
-                                             plan,
+                                             &plan,
                                              stream,
+                                             &timing,
                                              tempSpectrum,
                                              dst.bins[static_cast<std::size_t>(i)],
                                              error)) {
@@ -6128,10 +6845,20 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             return checkCuda(cudaGetLastError(), "mapSpectralKernel-zone", error);
         };
 
-        if (!createPlan(&plan, paddedWidth, paddedHeight, stream, error)) {
+        if (!acquireDirectPlanForSubsystem(subsystem, paddedWidth, paddedHeight, 1, &plan)) {
             return false;
         }
-        bool ok = makeImageSpectrum(redistributedDriver.ptr, width, height, paddedWidth, paddedHeight, plan, stream, driverSpectrum, error);
+        bool ok = makeImageSpectrum(redistributedDriver.ptr,
+                                    subsystem,
+                                    width,
+                                    height,
+                                    paddedWidth,
+                                    paddedHeight,
+                                    &plan,
+                                    stream,
+                                    &timing,
+                                    driverSpectrum,
+                                    error);
         if (ok && !splitMode) {
             ok = allocateSpectral(fullBins);
         }
@@ -6142,7 +6869,6 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             ok = allocateSpectral(structureBins);
         }
         if (!ok) {
-            cufftDestroy(plan);
             if (error && error->empty()) *error = "cuda-alloc-zone-spectral";
             return false;
         }
@@ -6175,7 +6901,6 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             ok = mapBinsStable(structureBins, *outStructure);
         }
         if (!ok) {
-            cufftDestroy(plan);
             return false;
         }
 
@@ -6184,7 +6909,6 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                 applyShoulderKernel<<<flatGrid, flatBlock, 0, stream>>>(
                     outCore->r.ptr, outCore->g.ptr, outCore->b.ptr, pixelCount, static_cast<float>(params.coreShoulder));
                 if (!checkCuda(cudaGetLastError(), "applyShoulderKernel-zone-core-spectral", error)) {
-                    cufftDestroy(plan);
                     return false;
                 }
             }
@@ -6192,7 +6916,6 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                 applyShoulderKernel<<<flatGrid, flatBlock, 0, stream>>>(
                     outStructure->r.ptr, outStructure->g.ptr, outStructure->b.ptr, pixelCount, static_cast<float>(params.structureShoulder));
                 if (!checkCuda(cudaGetLastError(), "applyShoulderKernel-zone-structure-spectral", error)) {
-                    cufftDestroy(plan);
                     return false;
                 }
             }
@@ -6205,7 +6928,6 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                 outEffect.r.ptr, outEffect.g.ptr, outEffect.b.ptr);
             ok = checkCuda(cudaGetLastError(), "combineRgbKernel-zone-spectral", error);
         }
-        cufftDestroy(plan);
         return ok;
     };
     auto renderFieldZonesStackedMono = [&](FieldEffectKind effectKind, PlaneSet* outPlaneSet) -> bool {
@@ -6266,9 +6988,9 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             DeviceBuffer<cufftComplex>* driverSpectrum = nullptr;
             DeviceBuffer<cufftComplex>* sourceStack = nullptr;
             DeviceBuffer<cufftComplex>* kernelStack = nullptr;
-            if (!getScalarSourceSpectrum(redistributedDriver, paddedWidth, paddedHeight, &driverSpectrum) ||
+            if (!getFieldScalarSourceSpectrum(redistributedDriver, paddedWidth, paddedHeight, &driverSpectrum) ||
                 !getReplicatedSpectrumStack(*driverSpectrum,
-                                            "field-split-driver:" + std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) +
+                                            fieldCacheNamespace + ":field-split-driver:" + std::to_string(paddedWidth) + "x" + std::to_string(paddedHeight) +
                                                 ":" + std::to_string(zoneCount * binCount),
                                             1,
                                             zoneCount * binCount,
@@ -6278,8 +7000,8 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
                 !buildFieldKernelSpectrumStack(effectKind, paddedWidth, paddedHeight, binCount, 1, 0, zoneCount, &kernelStack)) {
                 return false;
             }
-            CudaPlanLease plan;
-            if (!getPlanForDims(paddedWidth, paddedHeight, zoneCount * binCount, &plan)) {
+            CudaFftPlanLease plan;
+            if (!getPlanForDimsFor(CudaFftSubsystem::FieldRender, paddedWidth, paddedHeight, zoneCount * binCount, &plan)) {
                 return false;
             }
             const std::size_t paddedCount = static_cast<std::size_t>(paddedWidth) * paddedHeight;
@@ -6294,15 +7016,17 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             return timeCall(timing.convolutionMs, [&] {
                 return convolveSpectrumStackToPlaneStack(*sourceStack,
                                                          *kernelStack,
+                                                         CudaFftSubsystem::FieldRender,
                                                          width,
                                                          height,
                                                          paddedWidth,
                                                          paddedHeight,
                                                          zoneCount * binCount,
-                                                          plan.handle(),
+                                                         &plan,
                                                          stream,
                                                          *tempSpectrum,
                                                          *outPlaneStack,
+                                                         &timing,
                                                          error);
             });
         };
@@ -6361,7 +7085,8 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
             PlaneSet zoneEffect;
             PlaneSet zoneCore;
             PlaneSet zoneStructure;
-            if (!renderFromBinsStable(zone.bins,
+            if (!renderFromBinsStable(CudaFftSubsystem::FieldRender,
+                                      zone.bins,
                                       zoneEffect,
                                       outCore != nullptr ? &zoneCore : nullptr,
                                       outStructure != nullptr ? &zoneStructure : nullptr)) {
@@ -6535,7 +7260,8 @@ bool RunLensDiffCuda(const LensDiffRenderRequest& request,
         timing.fieldBranch = "global";
         const bool useStableGlobalSplitPath = splitMode;
         if (!(useStableGlobalSplitPath
-                  ? renderFromBinsStable(cache.bins,
+                  ? renderFromBinsStable(CudaFftSubsystem::GlobalRender,
+                                         cache.bins,
                                          effect,
                                          needCore ? &coreEffect : nullptr,
                                          needStructure ? &structureEffect : nullptr)

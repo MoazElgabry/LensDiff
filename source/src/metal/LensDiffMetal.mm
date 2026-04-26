@@ -2039,7 +2039,8 @@ kernel void lensDiffExtractRealPlaneKernel(device const float2* spectrum [[buffe
     }
     const uint srcIndex = gid.y * uint(params.paddedSize) + gid.x;
     const uint dstIndex = gid.y * uint(params.width) + gid.x;
-    dst[dstIndex] = max(0.0f, spectrum[srcIndex].x / max(float(params.paddedSize * params.paddedSize), 1.0f));
+    // Metal inverse FFT paths already normalize the spatial result.
+    dst[dstIndex] = max(0.0f, spectrum[srcIndex].x);
 }
 
 kernel void lensDiffPackPlanesToRgbaKernel(device const float* rPlane [[buffer(0)]],
