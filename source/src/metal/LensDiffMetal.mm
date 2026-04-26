@@ -2810,6 +2810,8 @@ PipelineBundle* ensurePipelines(id<MTLDevice> device, std::string* error) {
     return &gPipelines;
 }
 
+bool LensDiffMetalHeapsEnabled();
+
 id<MTLBuffer> makeSharedBuffer(id<MTLDevice> device, NSUInteger length, std::string* error) {
     auto tryHeapBuffer = [&](NSUInteger byteCount) -> id<MTLBuffer> {
         if (device == nil || byteCount == 0) {
@@ -5201,8 +5203,8 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
     }
     {
         std::ostringstream queueNote;
-        queueNote << "hostQueue=" << static_cast<const void*>(hostQueue)
-                  << " workQueue=" << static_cast<const void*>(queue);
+        queueNote << "hostQueue=" << (__bridge const void*)hostQueue
+                  << " workQueue=" << (__bridge const void*)queue;
         LogLensDiffDiagnosticEvent("metal-queues-ready", queueNote.str());
     }
     PipelineBundle* pipelines = ensurePipelines(device, error);
