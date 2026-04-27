@@ -1,8 +1,8 @@
 [Setup]
 AppId={{C1F5E7F5-77AA-4F63-8A95-5D642E4FA9D8}
 AppName=LensDiff
-AppVersion=0.2.7
-AppVerName=LensDiff OFX v0.2.7
+AppVersion=0.2.8
+AppVerName=LensDiff OFX v0.2.8
 AppPublisher=Moaz ELgabry
 AppPublisherURL=https://moazelgabry.com
 AppSupportURL=https://github.com/MoazElgabry/ME_OFX/issues
@@ -13,7 +13,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 DisableDirPage=yes
 DisableProgramGroupPage=yes
 OutputDir=.
-OutputBaseFilename=LensDiff_v0.2.7_Windows_Installer
+OutputBaseFilename=LensDiff_v0.2.8_Windows_Installer
 Compression=lzma
 SolidCompression=yes
 PrivilegesRequired=admin

@@ -5169,8 +5169,8 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
         return false;
     }
 
-    bool autoreleasePoolResult = false;
-    @autoreleasepool {
+    bool renderScopeResult = false;
+    {
     bool renderSucceeded = false;
     struct MetalRenderScopeLogger {
         bool* success = nullptr;
@@ -6798,11 +6798,11 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                    << " fastResolutionAware=" << (allowFastResolutionAware ? "true" : "false");
         LogLensDiffDiagnosticEvent("metal-render-return-ready", returnNote.str());
     }
-    autoreleasePoolResult = outputOk;
+    renderScopeResult = outputOk;
     }
-    LogLensDiffDiagnosticEvent("metal-autoreleasepool-exit",
-                               autoreleasePoolResult ? "outputOk=true" : "outputOk=false");
-    return autoreleasePoolResult;
+    LogLensDiffDiagnosticEvent("metal-render-scope-exit",
+                               renderScopeResult ? "outputOk=true" : "outputOk=false");
+    return renderScopeResult;
 }
 
 #else

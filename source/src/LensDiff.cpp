@@ -54,8 +54,8 @@ constexpr const char* kPluginDescription =
 constexpr const char* kPluginIdentifier = "com.moazelgabry.LensDiff";
 constexpr int kPluginVersionMajor = 0;
 constexpr int kPluginVersionMinor = 2;
-constexpr const char* kPluginVersionLabel = "v0.2.7";
-constexpr const char* kPluginDisplayVersion = "0.2.7";
+constexpr const char* kPluginVersionLabel = "v0.2.8";
+constexpr const char* kPluginDisplayVersion = "0.2.8";
 constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
 
 // LensDiff's FFT convolution depends on neighboring pixels and stable frame geometry.
