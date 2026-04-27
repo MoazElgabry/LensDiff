@@ -80,7 +80,7 @@ jobs:
         run: choco install ninja --no-progress -y
 
       - name: Install CUDA toolkit
-        uses: Jimver/cuda-toolkit@v0.2.30
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: "12.9.1"
 
