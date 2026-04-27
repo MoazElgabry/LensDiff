@@ -2975,6 +2975,10 @@ bool LensDiffMetalHeapsRequested() {
     return !lensDiffMetalEnvFlagEnabled("LENSDIFF_METAL_DISABLE_HEAPS");
 }
 
+bool LensDiffMetalHeapsForceEnabled() {
+    return lensDiffMetalEnvFlagEnabled("LENSDIFF_METAL_FORCE_HEAPS");
+}
+
 bool LensDiffMetalHeapsEnabled() {
     if (gLensDiffMetalHeapsOverride >= 0) {
         return gLensDiffMetalHeapsOverride != 0;
@@ -5301,8 +5305,10 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
          (fieldRequested && allowFastField));
     const bool legacySync = !fastPathAllowed;
     const bool heapsRequested = LensDiffMetalHeapsRequested();
+    const bool heapsForceEnabled = LensDiffMetalHeapsForceEnabled();
     const bool vkfftRequested = LensDiffMetalVkFFTRequested();
-    const bool heapsEnabled = heapsRequested && !legacySync;
+    const bool heapsSafeForMode = !resolutionAwareActive || heapsForceEnabled;
+    const bool heapsEnabled = heapsRequested && !legacySync && heapsSafeForMode;
     const bool vkfftEnabled = vkfftRequested && !legacySync;
     LensDiffMetalRuntimeOverrideScope runtimeOverride(heapsEnabled, vkfftEnabled);
     if (!timeCall(timing.psfBankMs, [&] { return ensurePsfBankMetal(params, cache, device, queue, pipelines, error); })) {
@@ -5315,6 +5321,7 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
         ",vkfftEffective=" + std::to_string(vkfftEnabled ? 1 : 0) +
         ",heapsRequested=" + std::to_string(heapsRequested ? 1 : 0) +
         ",heapsEffective=" + std::to_string(heapsEnabled ? 1 : 0) +
+        ",heapsForce=" + std::to_string(heapsForceEnabled ? 1 : 0) +
         ",requestedLegacy=" + std::to_string(requestedLegacySync ? 1 : 0) +
         ",field=" + std::to_string(cache.fieldZones.empty() ? 0 : 1) +
         ",canonical3x3=" + std::to_string(fieldPlan.canonical3x3 ? 1 : 0) +
