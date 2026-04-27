@@ -54,8 +54,8 @@ constexpr const char* kPluginDescription =
 constexpr const char* kPluginIdentifier = "com.moazelgabry.LensDiff";
 constexpr int kPluginVersionMajor = 0;
 constexpr int kPluginVersionMinor = 2;
-constexpr const char* kPluginVersionLabel = "v0.2.6";
-constexpr const char* kPluginDisplayVersion = "0.2.6";
+constexpr const char* kPluginVersionLabel = "v0.2.7";
+constexpr const char* kPluginDisplayVersion = "0.2.7";
 constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
 
 // LensDiff's FFT convolution depends on neighboring pixels and stable frame geometry.
@@ -3854,6 +3854,9 @@ void LensDiffEffect::render(const OFX::RenderArguments& args) {
                               << " debug=" << debugViewName(params.debugView);
             LogLensDiffDiagnosticEvent("host-metal-dispatch", metalDispatchNote.str());
         }
+        if (logEnabled) {
+            LogLensDiffDiagnosticEvent("host-metal-call-enter", "about-to-call RunLensDiffMetal");
+        }
         rendered = RunLensDiffMetal(request, params, cache_, &error);
         if (logEnabled) {
             std::ostringstream metalReturnNote;
@@ -3861,6 +3864,7 @@ void LensDiffEffect::render(const OFX::RenderArguments& args) {
             if (!error.empty()) {
                 metalReturnNote << " error=" << error;
             }
+            LogLensDiffDiagnosticEvent("host-metal-call-return", metalReturnNote.str());
             LogLensDiffDiagnosticEvent("host-metal-return", metalReturnNote.str());
         }
         if (rendered) {

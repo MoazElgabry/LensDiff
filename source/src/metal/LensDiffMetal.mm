@@ -2968,7 +2968,7 @@ bool LensDiffMetalFastSplitEnabled() {
 }
 
 bool LensDiffMetalFastResolutionAwareEnabled() {
-    return lensDiffMetalEnvFlagEnabled("LENSDIFF_METAL_FAST_RESOLUTION_AWARE");
+    return !lensDiffMetalEnvFlagEnabled("LENSDIFF_METAL_DISABLE_FAST_RESOLUTION_AWARE");
 }
 
 bool LensDiffMetalHeapsRequested() {
@@ -5169,6 +5169,7 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
         return false;
     }
 
+    bool autoreleasePoolResult = false;
     @autoreleasepool {
     bool renderSucceeded = false;
     struct MetalRenderScopeLogger {
@@ -6786,8 +6787,22 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
         LogLensDiffDiagnosticEvent("metal-output-ready", outputNote.str());
     }
     logTimingBreakdown();
-    return outputOk;
+    {
+        std::ostringstream returnNote;
+        returnNote << "outputOk=" << (outputOk ? "true" : "false")
+                   << " commandBuffers=" << renderCounters.commandBufferCount
+                   << " waits=" << renderCounters.waitCount
+                   << " legacySync=" << (legacySync ? "true" : "false")
+                   << " vkfftEffective=" << (useVkfftBackend ? "true" : "false")
+                   << " heapsEffective=" << (heapsEnabled ? "true" : "false")
+                   << " fastResolutionAware=" << (fastResolutionAware ? "true" : "false");
+        LogLensDiffDiagnosticEvent("metal-render-return-ready", returnNote.str());
     }
+    autoreleasePoolResult = outputOk;
+    }
+    LogLensDiffDiagnosticEvent("metal-autoreleasepool-exit",
+                               autoreleasePoolResult ? "outputOk=true" : "outputOk=false");
+    return autoreleasePoolResult;
 }
 
 #else
