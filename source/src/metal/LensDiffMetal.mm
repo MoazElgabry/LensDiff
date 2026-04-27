@@ -6793,9 +6793,9 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                    << " commandBuffers=" << renderCounters.commandBufferCount
                    << " waits=" << renderCounters.waitCount
                    << " legacySync=" << (legacySync ? "true" : "false")
-                   << " vkfftEffective=" << (useVkfftBackend ? "true" : "false")
+                   << " vkfftEffective=" << (vkfftEnabled ? "true" : "false")
                    << " heapsEffective=" << (heapsEnabled ? "true" : "false")
-                   << " fastResolutionAware=" << (fastResolutionAware ? "true" : "false");
+                   << " fastResolutionAware=" << (allowFastResolutionAware ? "true" : "false");
         LogLensDiffDiagnosticEvent("metal-render-return-ready", returnNote.str());
     }
     autoreleasePoolResult = outputOk;
