@@ -420,6 +420,17 @@ uint32_t rowFloats(const LensDiffImageView& view) {
     return static_cast<uint32_t>(view.rowBytes / static_cast<std::ptrdiff_t>(sizeof(float)));
 }
 
+LensDiffImageRect intersectRect(const LensDiffImageRect& a, const LensDiffImageRect& b) {
+    LensDiffImageRect out {};
+    out.x1 = std::max(a.x1, b.x1);
+    out.y1 = std::max(a.y1, b.y1);
+    out.x2 = std::min(a.x2, b.x2);
+    out.y2 = std::min(a.y2, b.y2);
+    if (out.x2 < out.x1) out.x2 = out.x1;
+    if (out.y2 < out.y1) out.y2 = out.y1;
+    return out;
+}
+
 NSUInteger ceilDiv(NSUInteger value, NSUInteger divisor) {
     return divisor == 0 ? 0 : (value + divisor - 1) / divisor;
 }
@@ -524,6 +535,8 @@ struct OutputParamsGpu {
     int srcOriginY = 0;
     int dstOriginX = 0;
     int dstOriginY = 0;
+    int dstX2 = 0;
+    int dstY2 = 0;
     int renderX1 = 0;
     int renderY1 = 0;
     int renderX2 = 0;
@@ -901,6 +914,8 @@ struct OutputParamsGpu {
     int srcOriginY;
     int dstOriginX;
     int dstOriginY;
+    int dstX2;
+    int dstY2;
     int renderX1;
     int renderY1;
     int renderX2;
@@ -2416,6 +2431,10 @@ kernel void lensDiffPackGrayKernel(device const float* gray [[buffer(0)]],
 
     const int absoluteX = params.renderX1 + int(gid.x);
     const int absoluteY = params.renderY1 + int(gid.y);
+    if (absoluteX < params.dstOriginX || absoluteY < params.dstOriginY ||
+        absoluteX >= params.dstX2 || absoluteY >= params.dstY2) {
+        return;
+    }
     const int sx = absoluteX - params.srcOriginX;
     const int sy = absoluteY - params.srcOriginY;
     if (sx < 0 || sy < 0 || sx >= params.srcWidth || sy >= params.srcHeight) {
@@ -2444,6 +2463,10 @@ kernel void lensDiffPackRgbKernel(device const float4* src [[buffer(0)]],
 
     const int absoluteX = params.renderX1 + int(gid.x);
     const int absoluteY = params.renderY1 + int(gid.y);
+    if (absoluteX < params.dstOriginX || absoluteY < params.dstOriginY ||
+        absoluteX >= params.dstX2 || absoluteY >= params.dstY2) {
+        return;
+    }
     const int sx = absoluteX - params.srcOriginX;
     const int sy = absoluteY - params.srcOriginY;
     if (sx < 0 || sy < 0 || sx >= params.srcWidth || sy >= params.srcHeight) {
@@ -5466,18 +5489,25 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
     if (staticDebug) {
         const std::vector<float> debugRgba = buildStaticDebugRgba(params, cache, nativeWidth, nativeHeight);
         id<MTLBuffer> debugBuffer = makeSharedBufferWithBytes(device, debugRgba.data(), nativeRgbaBytes, error);
+        const LensDiffImageRect outputRect = intersectRect(request.renderWindow, request.dst.bounds);
+        if (outputRect.width() <= 0 || outputRect.height() <= 0) {
+            renderSucceeded = true;
+            LogLensDiffDiagnosticEvent("metal-output-empty", "static-debug-renderWindow-outside-dst");
+            return true;
+        }
         const OutputParamsGpu outParams {
             nativeWidth, nativeHeight, request.src.bounds.x1, request.src.bounds.y1,
             request.dst.bounds.x1, request.dst.bounds.y1,
-            request.renderWindow.x1, request.renderWindow.y1,
-            request.renderWindow.x2, request.renderWindow.y2,
+            request.dst.bounds.x2, request.dst.bounds.y2,
+            outputRect.x1, outputRect.y1,
+            outputRect.x2, outputRect.y2,
             rowFloats(request.dst), 0, 0, 0};
         id<MTLBuffer> outParamsBuffer = makeParamBuffer(device, outParams, error);
         if (debugBuffer == nil || outParamsBuffer == nil) {
             return false;
         }
         return encode2d(pipelines->packRgb, @[debugBuffer, debugBuffer, dstBuffer, outParamsBuffer],
-                        request.renderWindow.width(), request.renderWindow.height());
+                        outputRect.width(), outputRect.height());
     }
 
     id<MTLBuffer> linearSrcNative = makeNativeRgbaBuffer();
@@ -6510,11 +6540,20 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
         return false;
     }
 
+    const LensDiffImageRect outputRect = intersectRect(request.renderWindow, request.dst.bounds);
+    if (outputRect.width() <= 0 || outputRect.height() <= 0) {
+        renderSucceeded = true;
+        LogLensDiffDiagnosticEvent("metal-output-empty", "renderWindow-outside-dst");
+        renderScopeResult = true;
+        return true;
+    }
+
     const OutputParamsGpu outParams {
         nativeWidth, nativeHeight, request.src.bounds.x1, request.src.bounds.y1,
         request.dst.bounds.x1, request.dst.bounds.y1,
-        request.renderWindow.x1, request.renderWindow.y1,
-        request.renderWindow.x2, request.renderWindow.y2,
+        request.dst.bounds.x2, request.dst.bounds.y2,
+        outputRect.x1, outputRect.y1,
+        outputRect.x2, outputRect.y2,
         rowFloats(request.dst), static_cast<int>(params.inputTransfer),
         params.debugView == LensDiffDebugView::Final ? 1 : 0,
         params.debugView == LensDiffDebugView::Final ? 1 : 0};
@@ -6543,8 +6582,8 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                                     encode2dDispatch(encoder,
                                                      pipelines->packGray,
                                                      @[nativeMask, dstBuffer, outParamsBuffer],
-                                                     request.renderWindow.width(),
-                                                     request.renderWindow.height());
+                                                     outputRect.width(),
+                                                     outputRect.height());
                     [encoder endEncoding];
                     outputOk = ok && commitAndWaitCounted(&renderCounters, commandBuffer, error);
                 } else {
@@ -6552,21 +6591,21 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                                encode2dDispatch(renderContext.encoder,
                                                 pipelines->packGray,
                                                 @[nativeMask, dstBuffer, outParamsBuffer],
-                                                request.renderWindow.width(),
-                                                request.renderWindow.height());
+                                                outputRect.width(),
+                                                outputRect.height());
                 }
                 break;
             }
             outputOk = legacySync
-                ? encode2d(pipelines->packGray,
+                           ? encode2d(pipelines->packGray,
                            @[mask, dstBuffer, outParamsBuffer],
-                           request.renderWindow.width(),
-                           request.renderWindow.height())
+                           outputRect.width(),
+                           outputRect.height())
                 : encode2dDispatch(renderContext.encoder,
                                    pipelines->packGray,
                                    @[mask, dstBuffer, outParamsBuffer],
-                                   request.renderWindow.width(),
-                                   request.renderWindow.height());
+                                   outputRect.width(),
+                                   outputRect.height());
             break;
         case LensDiffDebugView::Core:
             if (coreBuffer == nil) return false;
@@ -6581,8 +6620,8 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                                     encode2dDispatch(encoder,
                                                      pipelines->packRgb,
                                                      @[nativeCore, linearSrcNative, dstBuffer, outParamsBuffer],
-                                                     request.renderWindow.width(),
-                                                     request.renderWindow.height());
+                                                     outputRect.width(),
+                                                     outputRect.height());
                     [encoder endEncoding];
                     outputOk = ok && commitAndWaitCounted(&renderCounters, commandBuffer, error);
                 } else {
@@ -6590,21 +6629,21 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                                encode2dDispatch(renderContext.encoder,
                                                 pipelines->packRgb,
                                                 @[nativeCore, linearSrcNative, dstBuffer, outParamsBuffer],
-                                                request.renderWindow.width(),
-                                                request.renderWindow.height());
+                                                outputRect.width(),
+                                                outputRect.height());
                 }
                 break;
             }
             outputOk = legacySync
-                ? encode2d(pipelines->packRgb,
+                           ? encode2d(pipelines->packRgb,
                            @[coreBuffer, linearSrcNative, dstBuffer, outParamsBuffer],
-                           request.renderWindow.width(),
-                           request.renderWindow.height())
+                           outputRect.width(),
+                           outputRect.height())
                 : encode2dDispatch(renderContext.encoder,
                                    pipelines->packRgb,
                                    @[coreBuffer, linearSrcNative, dstBuffer, outParamsBuffer],
-                                   request.renderWindow.width(),
-                                   request.renderWindow.height());
+                                   outputRect.width(),
+                                   outputRect.height());
             break;
         case LensDiffDebugView::Structure:
             if (structureBuffer == nil) return false;
@@ -6619,8 +6658,8 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                                     encode2dDispatch(encoder,
                                                      pipelines->packRgb,
                                                      @[nativeStructure, linearSrcNative, dstBuffer, outParamsBuffer],
-                                                     request.renderWindow.width(),
-                                                     request.renderWindow.height());
+                                                     outputRect.width(),
+                                                     outputRect.height());
                     [encoder endEncoding];
                     outputOk = ok && commitAndWaitCounted(&renderCounters, commandBuffer, error);
                 } else {
@@ -6628,21 +6667,21 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                                encode2dDispatch(renderContext.encoder,
                                                 pipelines->packRgb,
                                                 @[nativeStructure, linearSrcNative, dstBuffer, outParamsBuffer],
-                                                request.renderWindow.width(),
-                                                request.renderWindow.height());
+                                                outputRect.width(),
+                                                outputRect.height());
                 }
                 break;
             }
             outputOk = legacySync
-                ? encode2d(pipelines->packRgb,
+                           ? encode2d(pipelines->packRgb,
                            @[structureBuffer, linearSrcNative, dstBuffer, outParamsBuffer],
-                           request.renderWindow.width(),
-                           request.renderWindow.height())
+                           outputRect.width(),
+                           outputRect.height())
                 : encode2dDispatch(renderContext.encoder,
                                    pipelines->packRgb,
                                    @[structureBuffer, linearSrcNative, dstBuffer, outParamsBuffer],
-                                   request.renderWindow.width(),
-                                   request.renderWindow.height());
+                                   outputRect.width(),
+                                   outputRect.height());
             break;
         case LensDiffDebugView::Effect:
             if (effectBuffer == nil) return false;
@@ -6657,8 +6696,8 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                                     encode2dDispatch(encoder,
                                                      pipelines->packRgb,
                                                      @[nativeEffect, linearSrcNative, dstBuffer, outParamsBuffer],
-                                                     request.renderWindow.width(),
-                                                     request.renderWindow.height());
+                                                     outputRect.width(),
+                                                     outputRect.height());
                     [encoder endEncoding];
                     outputOk = ok && commitAndWaitCounted(&renderCounters, commandBuffer, error);
                 } else {
@@ -6666,21 +6705,21 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                                encode2dDispatch(renderContext.encoder,
                                                 pipelines->packRgb,
                                                 @[nativeEffect, linearSrcNative, dstBuffer, outParamsBuffer],
-                                                request.renderWindow.width(),
-                                                request.renderWindow.height());
+                                                outputRect.width(),
+                                                outputRect.height());
                 }
                 break;
             }
             outputOk = legacySync
-                ? encode2d(pipelines->packRgb,
+                           ? encode2d(pipelines->packRgb,
                            @[effectBuffer, linearSrcNative, dstBuffer, outParamsBuffer],
-                           request.renderWindow.width(),
-                           request.renderWindow.height())
+                           outputRect.width(),
+                           outputRect.height())
                 : encode2dDispatch(renderContext.encoder,
                                    pipelines->packRgb,
                                    @[effectBuffer, linearSrcNative, dstBuffer, outParamsBuffer],
-                                   request.renderWindow.width(),
-                                   request.renderWindow.height());
+                                   outputRect.width(),
+                                   outputRect.height());
             break;
         case LensDiffDebugView::Scatter:
             if (scatterPreview == nil) return false;
@@ -6695,8 +6734,8 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                                     encode2dDispatch(encoder,
                                                      pipelines->packRgb,
                                                      @[nativeScatter, linearSrcNative, dstBuffer, outParamsBuffer],
-                                                     request.renderWindow.width(),
-                                                     request.renderWindow.height());
+                                                     outputRect.width(),
+                                                     outputRect.height());
                     [encoder endEncoding];
                     outputOk = ok && commitAndWaitCounted(&renderCounters, commandBuffer, error);
                 } else {
@@ -6704,21 +6743,21 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                                encode2dDispatch(renderContext.encoder,
                                                 pipelines->packRgb,
                                                 @[nativeScatter, linearSrcNative, dstBuffer, outParamsBuffer],
-                                                request.renderWindow.width(),
-                                                request.renderWindow.height());
+                                                outputRect.width(),
+                                                outputRect.height());
                 }
                 break;
             }
             outputOk = legacySync
-                ? encode2d(pipelines->packRgb,
+                           ? encode2d(pipelines->packRgb,
                            @[scatterPreview, linearSrcNative, dstBuffer, outParamsBuffer],
-                           request.renderWindow.width(),
-                           request.renderWindow.height())
+                           outputRect.width(),
+                           outputRect.height())
                 : encode2dDispatch(renderContext.encoder,
                                    pipelines->packRgb,
                                    @[scatterPreview, linearSrcNative, dstBuffer, outParamsBuffer],
-                                   request.renderWindow.width(),
-                                   request.renderWindow.height());
+                                   outputRect.width(),
+                                   outputRect.height());
             break;
         case LensDiffDebugView::CreativeFringe:
             if (creativeFringePreview == nil) return false;
@@ -6733,8 +6772,8 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                                     encode2dDispatch(encoder,
                                                      pipelines->packRgb,
                                                      @[nativeFringe, linearSrcNative, dstBuffer, outParamsBuffer],
-                                                     request.renderWindow.width(),
-                                                     request.renderWindow.height());
+                                                     outputRect.width(),
+                                                     outputRect.height());
                     [encoder endEncoding];
                     outputOk = ok && commitAndWaitCounted(&renderCounters, commandBuffer, error);
                 } else {
@@ -6742,32 +6781,32 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                                encode2dDispatch(renderContext.encoder,
                                                 pipelines->packRgb,
                                                 @[nativeFringe, linearSrcNative, dstBuffer, outParamsBuffer],
-                                                request.renderWindow.width(),
-                                                request.renderWindow.height());
+                                                outputRect.width(),
+                                                outputRect.height());
                 }
                 break;
             }
             outputOk = legacySync
-                ? encode2d(pipelines->packRgb,
+                           ? encode2d(pipelines->packRgb,
                            @[creativeFringePreview, linearSrcNative, dstBuffer, outParamsBuffer],
-                           request.renderWindow.width(),
-                           request.renderWindow.height())
+                           outputRect.width(),
+                           outputRect.height())
                 : encode2dDispatch(renderContext.encoder,
                                    pipelines->packRgb,
                                    @[creativeFringePreview, linearSrcNative, dstBuffer, outParamsBuffer],
-                                   request.renderWindow.width(),
-                                   request.renderWindow.height());
+                                   outputRect.width(),
+                                   outputRect.height());
             break;
         case LensDiffDebugView::Final:
         default:
             outputOk = finalBuffer != nil &&
                        (legacySync
-                            ? encode2d(pipelines->packRgb, @[finalBuffer, linearSrcNative, dstBuffer, outParamsBuffer], request.renderWindow.width(), request.renderWindow.height())
+                            ? encode2d(pipelines->packRgb, @[finalBuffer, linearSrcNative, dstBuffer, outParamsBuffer], outputRect.width(), outputRect.height())
                             : encode2dDispatch(renderContext.encoder,
                                                pipelines->packRgb,
                                                @[finalBuffer, linearSrcNative, dstBuffer, outParamsBuffer],
-                                               request.renderWindow.width(),
-                                               request.renderWindow.height()));
+                                               outputRect.width(),
+                                               outputRect.height()));
             break;
     }
     if (!legacySync) {

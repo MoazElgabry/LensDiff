@@ -54,8 +54,8 @@ constexpr const char* kPluginDescription =
 constexpr const char* kPluginIdentifier = "com.moazelgabry.LensDiff";
 constexpr int kPluginVersionMajor = 0;
 constexpr int kPluginVersionMinor = 2;
-constexpr const char* kPluginVersionLabel = "v0.2.8";
-constexpr const char* kPluginDisplayVersion = "0.2.8";
+constexpr const char* kPluginVersionLabel = "v0.2.9";
+constexpr const char* kPluginDisplayVersion = "0.2.9";
 constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
 
 // LensDiff's FFT convolution depends on neighboring pixels and stable frame geometry.
@@ -3900,6 +3900,21 @@ void LensDiffEffect::render(const OFX::RenderArguments& args) {
         const double elapsedMs =
             std::chrono::duration<double, std::milli>(renderEnd - renderStart).count();
         logLensDiffRender(timingEnabled, executedBackend, request, params, note, elapsedMs);
+        LogLensDiffDiagnosticEvent("host-render-success-logged", backendName(executedBackend));
+    }
+
+    if (logEnabled) {
+        LogLensDiffDiagnosticEvent("host-image-release-enter", "src");
+    }
+    src.reset();
+    if (logEnabled) {
+        LogLensDiffDiagnosticEvent("host-image-release-complete", "src");
+        LogLensDiffDiagnosticEvent("host-image-release-enter", "dst");
+    }
+    dst.reset();
+    if (logEnabled) {
+        LogLensDiffDiagnosticEvent("host-image-release-complete", "dst");
+        LogLensDiffDiagnosticEvent("host-render-return-ok", backendName(executedBackend));
     }
 }
 
