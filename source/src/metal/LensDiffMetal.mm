@@ -5331,10 +5331,23 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
     const bool heapsRequested = LensDiffMetalHeapsRequested();
     const bool heapsForceEnabled = LensDiffMetalHeapsForceEnabled();
     const bool vkfftRequested = LensDiffMetalVkFFTRequested();
-    const bool heapsSafeForMode = !resolutionAwareActive || heapsForceEnabled;
+    const bool heapsSafeForMode = heapsForceEnabled;
     const bool heapsEnabled = heapsRequested && !legacySync && heapsSafeForMode;
     const bool vkfftEnabled = vkfftRequested && !legacySync;
     LensDiffMetalRuntimeOverrideScope runtimeOverride(heapsEnabled, vkfftEnabled);
+    {
+        std::ostringstream preflightNote;
+        preflightNote << "mode=" << (legacySync ? "stable" : "fast")
+                      << ",vkfftRequested=" << (vkfftRequested ? 1 : 0)
+                      << ",vkfftEffective=" << (vkfftEnabled ? 1 : 0)
+                      << ",heapsRequested=" << (heapsRequested ? 1 : 0)
+                      << ",heapsEffective=" << (heapsEnabled ? 1 : 0)
+                      << ",heapsForce=" << (heapsForceEnabled ? 1 : 0)
+                      << ",resolutionAware=" << (resolutionAwareActive ? 1 : 0)
+                      << ",native=" << nativeWidth << "x" << nativeHeight
+                      << ",working=" << width << "x" << height;
+        LogLensDiffDiagnosticEvent("metal-render-mode-preflight", preflightNote.str());
+    }
     if (!timeCall(timing.psfBankMs, [&] { return ensurePsfBankMetal(params, cache, device, queue, pipelines, error); })) {
         return false;
     }
