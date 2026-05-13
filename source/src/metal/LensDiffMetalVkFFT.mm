@@ -193,9 +193,9 @@ bool lensDiffMetalVkFFTEncodeSquare(id<MTLCommandBuffer> commandBuffer,
 
     // Release the GPU slot when this command buffer finishes executing on the GPU.
     dispatch_semaphore_t semaphore = plan->gpuSemaphore;
-    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> __unused _cb) {
+    commandBufferCpp->addCompletedHandler(^(MTL::CommandBuffer*) {
         dispatch_semaphore_signal(semaphore);
-    }];
+    });
     return true;
 }
 
