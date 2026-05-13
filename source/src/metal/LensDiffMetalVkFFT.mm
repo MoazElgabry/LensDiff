@@ -8,7 +8,7 @@
 
 #include "../../external/VkFFT/vkFFT/vkFFT.h"
 
-#import <Foundation/Foundation.h>
+#include <dispatch/dispatch.h>
 
 #include <cstdint>
 #include <memory>
