@@ -54,8 +54,8 @@ constexpr const char* kPluginDescription =
 constexpr const char* kPluginIdentifier = "com.moazelgabry.LensDiff";
 constexpr int kPluginVersionMajor = 0;
 constexpr int kPluginVersionMinor = 2;
-constexpr const char* kPluginVersionLabel = "v0.2.10";
-constexpr const char* kPluginDisplayVersion = "0.2.10";
+constexpr const char* kPluginVersionLabel = "v0.2.11";
+constexpr const char* kPluginDisplayVersion = "0.2.11";
 constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
 
 // LensDiff's FFT convolution depends on neighboring pixels and stable frame geometry.
@@ -3808,8 +3808,8 @@ void LensDiffEffect::render(const OFX::RenderArguments& args) {
     const LensDiffParams params = resolveParams(args.time, request.frameShortSidePx);
     request.requestedBackend = resolveRenderBackend(args, getChoiceValueAtTime(backendPreference_, args.time));
     request.estimatedSupportRadiusPx = ResolveLensDiffMaxKernelRadiusPx(params);
-    const bool logEnabled = envFlagEnabled("LENSDIFF_LOG");
-    const bool timingEnabled = envFlagEnabled("LENSDIFF_TIMING");
+    const bool logEnabled = LensDiffLogEnabled();
+    const bool timingEnabled = LensDiffTimingEnabled();
     const auto renderStart = std::chrono::steady_clock::now();
 
     bool rendered = false;

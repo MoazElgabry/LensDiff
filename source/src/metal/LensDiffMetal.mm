@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <unordered_map>
@@ -793,7 +794,7 @@ bool encodeSquareInverseFftStack(id<MTLCommandBuffer> commandBuffer,
                                  std::string* error);
 
 std::mutex gPipelineMutex;
-PipelineBundle gPipelines;
+std::shared_ptr<PipelineBundle> gPipelinesPtr;
 std::mutex gWorkQueueMutex;
 id<MTLDevice> gWorkQueueDevice = nil;
 id<MTLCommandQueue> gWorkQueue = nil;
@@ -2703,10 +2704,10 @@ id<MTLComputePipelineState> makePipeline(id<MTLDevice> device,
     return pipeline;
 }
 
-PipelineBundle* ensurePipelines(id<MTLDevice> device, std::string* error) {
+std::shared_ptr<PipelineBundle> ensurePipelines(id<MTLDevice> device, std::string* error) {
     std::lock_guard<std::mutex> lock(gPipelineMutex);
-    if (gPipelines.device == device && gPipelines.prepare != nil) {
-        return &gPipelines;
+    if (gPipelinesPtr && gPipelinesPtr->device == device && gPipelinesPtr->prepare != nil) {
+        return gPipelinesPtr;
     }
 
     const auto libraryLoadStart = std::chrono::steady_clock::now();
@@ -2829,8 +2830,8 @@ PipelineBundle* ensurePipelines(id<MTLDevice> device, std::string* error) {
         return nullptr;
     }
 
-    gPipelines = next;
-    return &gPipelines;
+    gPipelinesPtr = std::make_shared<PipelineBundle>(std::move(next));
+    return gPipelinesPtr;
 }
 
 bool LensDiffMetalHeapsEnabled();
@@ -2966,7 +2967,20 @@ bool commitAndWait(id<MTLCommandBuffer> commandBuffer, std::string* error) {
     return true;
 }
 
-bool lensDiffMetalEnvFlagEnabled(const char* name) {
+struct LensDiffMetalEnvFlagCache {
+    bool legacySync = false;
+    bool fastField = false;
+    bool fastSplit = false;
+    bool disableFastResolutionAware = false;
+    bool disableHeaps = false;
+    bool forceHeaps = false;
+    bool disableVkFFT = false;
+};
+
+static std::once_flag gEnvFlagCacheOnce;
+static LensDiffMetalEnvFlagCache gEnvFlagCache;
+
+static bool parseEnvFlag(const char* name) {
     const char* value = std::getenv(name);
     if (value == nullptr || *value == '\0') {
         return false;
@@ -2975,31 +2989,44 @@ bool lensDiffMetalEnvFlagEnabled(const char* name) {
     return text != "0" && text != "false" && text != "FALSE" && text != "off" && text != "OFF";
 }
 
+static const LensDiffMetalEnvFlagCache& cachedEnvFlags() {
+    std::call_once(gEnvFlagCacheOnce, [] {
+        gEnvFlagCache.legacySync               = parseEnvFlag("LENSDIFF_METAL_LEGACY_SYNC");
+        gEnvFlagCache.fastField                = parseEnvFlag("LENSDIFF_METAL_FAST_FIELD");
+        gEnvFlagCache.fastSplit                = parseEnvFlag("LENSDIFF_METAL_FAST_SPLIT");
+        gEnvFlagCache.disableFastResolutionAware = parseEnvFlag("LENSDIFF_METAL_DISABLE_FAST_RESOLUTION_AWARE");
+        gEnvFlagCache.disableHeaps             = parseEnvFlag("LENSDIFF_METAL_DISABLE_HEAPS");
+        gEnvFlagCache.forceHeaps               = parseEnvFlag("LENSDIFF_METAL_FORCE_HEAPS");
+        gEnvFlagCache.disableVkFFT             = parseEnvFlag("LENSDIFF_METAL_DISABLE_VKFFT");
+    });
+    return gEnvFlagCache;
+}
+
 thread_local int gLensDiffMetalHeapsOverride = -1;
 thread_local int gLensDiffMetalVkFFTOverride = -1;
 
 bool LensDiffMetalLegacySyncEnabled() {
-    return lensDiffMetalEnvFlagEnabled("LENSDIFF_METAL_LEGACY_SYNC");
+    return cachedEnvFlags().legacySync;
 }
 
 bool LensDiffMetalFastFieldEnabled() {
-    return lensDiffMetalEnvFlagEnabled("LENSDIFF_METAL_FAST_FIELD");
+    return cachedEnvFlags().fastField;
 }
 
 bool LensDiffMetalFastSplitEnabled() {
-    return lensDiffMetalEnvFlagEnabled("LENSDIFF_METAL_FAST_SPLIT");
+    return cachedEnvFlags().fastSplit;
 }
 
 bool LensDiffMetalFastResolutionAwareEnabled() {
-    return !lensDiffMetalEnvFlagEnabled("LENSDIFF_METAL_DISABLE_FAST_RESOLUTION_AWARE");
+    return !cachedEnvFlags().disableFastResolutionAware;
 }
 
 bool LensDiffMetalHeapsRequested() {
-    return !lensDiffMetalEnvFlagEnabled("LENSDIFF_METAL_DISABLE_HEAPS");
+    return !cachedEnvFlags().disableHeaps;
 }
 
 bool LensDiffMetalHeapsForceEnabled() {
-    return lensDiffMetalEnvFlagEnabled("LENSDIFF_METAL_FORCE_HEAPS");
+    return cachedEnvFlags().forceHeaps;
 }
 
 bool LensDiffMetalHeapsEnabled() {
@@ -3010,7 +3037,7 @@ bool LensDiffMetalHeapsEnabled() {
 }
 
 bool LensDiffMetalVkFFTRequested() {
-    return !lensDiffMetalEnvFlagEnabled("LENSDIFF_METAL_DISABLE_VKFFT");
+    return !cachedEnvFlags().disableVkFFT;
 }
 
 bool LensDiffMetalVkFFTEnabled() {
@@ -5232,10 +5259,11 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                   << " workQueue=" << (__bridge const void*)queue;
         LogLensDiffDiagnosticEvent("metal-queues-ready", queueNote.str());
     }
-    PipelineBundle* pipelines = ensurePipelines(device, error);
-    if (pipelines == nullptr) {
+    std::shared_ptr<PipelineBundle> pipelinesRef = ensurePipelines(device, error);
+    if (!pipelinesRef) {
         return false;
     }
+    PipelineBundle* pipelines = pipelinesRef.get();
     LogLensDiffDiagnosticEvent("metal-pipelines-ready");
 
     struct MetalRenderTimingBreakdown {
@@ -5333,7 +5361,12 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
     const bool vkfftRequested = LensDiffMetalVkFFTRequested();
     const bool heapsSafeForMode = heapsForceEnabled;
     const bool heapsEnabled = heapsRequested && !legacySync && heapsSafeForMode;
-    const bool vkfftEnabled = vkfftRequested && !legacySync;
+    // VkFFT's Metal backend stores launch metadata in plan-owned buffers. Reusing one plan from
+    // the staged fast path can require multiple appends into the same open command buffer, which
+    // can deadlock a completion-fenced plan and can also overwrite metadata before earlier
+    // dispatches have executed. Keep VkFFT on the sync-heavy path where each append is committed
+    // before another same-plan append can be encoded.
+    const bool vkfftEnabled = vkfftRequested && legacySync;
     LensDiffMetalRuntimeOverrideScope runtimeOverride(heapsEnabled, vkfftEnabled);
     {
         std::ostringstream preflightNote;

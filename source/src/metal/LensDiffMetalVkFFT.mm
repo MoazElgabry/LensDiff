@@ -8,6 +8,8 @@
 
 #include "../../external/VkFFT/vkFFT/vkFFT.h"
 
+#import <Foundation/Foundation.h>
+
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -18,13 +20,11 @@ namespace {
 
 struct VkFFTPlanKey {
     std::uintptr_t device = 0;
-    std::uintptr_t queue = 0;
     int size = 0;
     int imageCount = 0;
 
     bool operator==(const VkFFTPlanKey& other) const {
         return device == other.device &&
-               queue == other.queue &&
                size == other.size &&
                imageCount == other.imageCount;
     }
@@ -33,7 +33,6 @@ struct VkFFTPlanKey {
 struct VkFFTPlanKeyHasher {
     std::size_t operator()(const VkFFTPlanKey& key) const noexcept {
         std::size_t hash = key.device;
-        hash = hash * 1315423911u + key.queue;
         hash = hash * 2654435761u + static_cast<std::size_t>(key.size);
         hash = hash * 2246822519u + static_cast<std::size_t>(key.imageCount);
         return hash;
@@ -45,6 +44,12 @@ struct CachedVkFFTPlan {
     MTL::Buffer* configBuffer = nullptr;
     pfUINT configBufferSize = 0;
     std::mutex mutex;
+    // Limits concurrent GPU execution to one command buffer at a time.
+    // VkFFT shares internal MTLBuffers (e.g. pushConstants.dataUintBuffer) across all encodes
+    // using the same plan; a second GPU dispatch while the first is still in flight races on
+    // those shared buffers.  Acquire before VkFFTAppend, release in the command-buffer
+    // completion handler so the CPU never blocks beyond what Metal already requires.
+    dispatch_semaphore_t gpuSemaphore = dispatch_semaphore_create(1);
 
     ~CachedVkFFTPlan() {
         deleteVkFFT(&app);
@@ -86,7 +91,6 @@ bool initializePlan(id<MTLCommandBuffer> commandBuffer,
 
     const VkFFTPlanKey key {
         reinterpret_cast<std::uintptr_t>(deviceCpp),
-        reinterpret_cast<std::uintptr_t>(queueCpp),
         size,
         imageCount
     };
@@ -173,15 +177,25 @@ bool lensDiffMetalVkFFTEncodeSquare(id<MTLCommandBuffer> commandBuffer,
     launchParams.commandEncoder = (__bridge MTL::ComputeCommandEncoder*)encoder;
     launchParams.buffer = &spectrumBuffer;
 
+    // Block until any previous GPU execution using this plan's shared internal buffers completes.
+    dispatch_semaphore_wait(plan->gpuSemaphore, DISPATCH_TIME_FOREVER);
+
     const int direction = inverse ? 1 : -1;
     std::lock_guard<std::mutex> lock(plan->mutex);
     const VkFFTResult result = VkFFTAppend(&plan->app, direction, &launchParams);
     if (result != VKFFT_SUCCESS) {
+        dispatch_semaphore_signal(plan->gpuSemaphore);
         if (error != nullptr) {
             *error = "metal-vkfft-append-failed:" + vkfftResultText(result);
         }
         return false;
     }
+
+    // Release the GPU slot when this command buffer finishes executing on the GPU.
+    dispatch_semaphore_t semaphore = plan->gpuSemaphore;
+    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> __unused _cb) {
+        dispatch_semaphore_signal(semaphore);
+    }];
     return true;
 }
 

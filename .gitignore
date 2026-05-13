@@ -12,3 +12,4 @@ source/.meson-venv/
 *.user
 *.VC.db
 *.VC.opendb
+/docs

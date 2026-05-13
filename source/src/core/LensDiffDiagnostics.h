@@ -22,11 +22,13 @@ inline bool LensDiffEnvFlagEnabled(const char* name) {
 }
 
 inline bool LensDiffTimingEnabled() {
-    return LensDiffEnvFlagEnabled("LENSDIFF_TIMING");
+    static bool value = LensDiffEnvFlagEnabled("LENSDIFF_TIMING");
+    return value;
 }
 
 inline bool LensDiffLogEnabled() {
-    return LensDiffEnvFlagEnabled("LENSDIFF_LOG");
+    static bool value = LensDiffEnvFlagEnabled("LENSDIFF_LOG");
+    return value;
 }
 
 inline bool LensDiffDiagnosticsFileEnabled() {
