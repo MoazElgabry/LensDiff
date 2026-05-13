@@ -44,11 +44,11 @@ struct CachedVkFFTPlan {
     MTL::Buffer* configBuffer = nullptr;
     pfUINT configBufferSize = 0;
     std::mutex mutex;
-    // Limits concurrent GPU execution to one command buffer at a time.
+    // Reserves this plan for at most one in-flight command buffer at a time.
     // VkFFT shares internal MTLBuffers (e.g. pushConstants.dataUintBuffer) across all encodes
     // using the same plan; a second GPU dispatch while the first is still in flight races on
-    // those shared buffers.  Acquire before VkFFTAppend, release in the command-buffer
-    // completion handler so the CPU never blocks beyond what Metal already requires.
+    // those shared buffers. Acquire before VkFFTAppend, release in the command-buffer
+    // completion handler, and let callers fall back instead of blocking on a busy plan.
     dispatch_semaphore_t gpuSemaphore = dispatch_semaphore_create(1);
 
     ~CachedVkFFTPlan() {
@@ -171,14 +171,30 @@ bool lensDiffMetalVkFFTEncodeSquare(id<MTLCommandBuffer> commandBuffer,
         return false;
     }
 
+    MTL::CommandBuffer* commandBufferCpp = (__bridge MTL::CommandBuffer*)commandBuffer;
+    MTL::ComputeCommandEncoder* encoderCpp = (__bridge MTL::ComputeCommandEncoder*)encoder;
     MTL::Buffer* spectrumBuffer = (__bridge MTL::Buffer*)spectrum;
+    if (commandBufferCpp == nullptr || encoderCpp == nullptr || spectrumBuffer == nullptr) {
+        if (error != nullptr) {
+            *error = "metal-vkfft-invalid-metal-cpp-bridge";
+        }
+        return false;
+    }
+
     VkFFTLaunchParams launchParams {};
-    launchParams.commandBuffer = (__bridge MTL::CommandBuffer*)commandBuffer;
-    launchParams.commandEncoder = (__bridge MTL::ComputeCommandEncoder*)encoder;
+    launchParams.commandBuffer = commandBufferCpp;
+    launchParams.commandEncoder = encoderCpp;
     launchParams.buffer = &spectrumBuffer;
 
-    // Block until any previous GPU execution using this plan's shared internal buffers completes.
-    dispatch_semaphore_wait(plan->gpuSemaphore, DISPATCH_TIME_FOREVER);
+    // Do not block here: the staged Metal path can encode several FFTs before committing the
+    // command buffer. If this plan is already reserved, fall back to LensDiff's custom Metal FFT
+    // instead of waiting for a command buffer that this same thread may still need to commit.
+    if (dispatch_semaphore_wait(plan->gpuSemaphore, DISPATCH_TIME_NOW) != 0) {
+        if (error != nullptr) {
+            *error = "metal-vkfft-plan-busy";
+        }
+        return false;
+    }
 
     const int direction = inverse ? 1 : -1;
     std::lock_guard<std::mutex> lock(plan->mutex);
