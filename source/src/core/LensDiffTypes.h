@@ -16,6 +16,7 @@ enum class LensDiffBackendType {
     CpuReference,
     Cuda,
     Metal,
+    OpenCL,
 };
 
 enum class LensDiffExtractionMode {
@@ -102,6 +103,7 @@ struct LensDiffImageRect {
 
 struct LensDiffImageView {
     void* data = nullptr;
+    void* openCLImage = nullptr; // cl_mem image, void* to avoid CL headers in core
     std::ptrdiff_t rowBytes = 0;
     LensDiffImageRect bounds {};
     int originX = 0;
@@ -121,8 +123,10 @@ struct LensDiffRenderRequest {
     int estimatedSupportRadiusPx = 0;
     bool hostEnabledCudaRender = false;
     bool hostEnabledMetalRender = false;
+    bool hostEnabledOpenCLRender = false;
     void* cudaStream = nullptr;
     void* metalCommandQueue = nullptr;
+    void* openCLCommandQueue = nullptr; // cl_command_queue, void* to avoid CL headers in core
 };
 
 struct LensDiffParams {

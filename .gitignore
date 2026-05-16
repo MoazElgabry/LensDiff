@@ -13,3 +13,4 @@ source/.meson-venv/
 *.VC.db
 *.VC.opendb
 /docs
+docs/development-plan.md

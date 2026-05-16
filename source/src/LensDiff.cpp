@@ -11,6 +11,9 @@
 #ifdef __APPLE__
 #include "metal/LensDiffMetal.h"
 #endif
+#if defined(LENSDIFF_HAS_OPENCL)
+#include "opencl/LensDiffOpenCL.h"
+#endif
 #include "ofxsLog.h"
 
 #include <algorithm>
@@ -54,8 +57,8 @@ constexpr const char* kPluginDescription =
 constexpr const char* kPluginIdentifier = "com.moazelgabry.LensDiff";
 constexpr int kPluginVersionMajor = 0;
 constexpr int kPluginVersionMinor = 2;
-constexpr const char* kPluginVersionLabel = "v0.2.14";
-constexpr const char* kPluginDisplayVersion = "0.2.14";
+constexpr const char* kPluginVersionLabel = "v0.2.15";
+constexpr const char* kPluginDisplayVersion = "0.2.15";
 constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
 
 // LensDiff's FFT convolution depends on neighboring pixels and stable frame geometry.
@@ -64,6 +67,7 @@ constexpr const char* kWebsiteUrl = "https://moazelgabry.com";
 constexpr bool kSupportsTiles = false;
 constexpr bool kSupportsMultiResolution = true;
 constexpr bool kSupportsMultipleClipPARs = false;
+constexpr bool kOpenCLRenderImplemented = true;
 constexpr int kDefaultApertureChoiceIndex = 1;
 constexpr int kLastBuiltinApertureChoiceIndex = 6;
 constexpr int kCustomApertureChoiceIndex = 7;
@@ -1706,6 +1710,7 @@ LensDiffImageView makeImageView(OFX::Image* image) {
 
     const OfxRectI bounds = image->getBounds();
     view.data = image->getPixelData();
+    view.openCLImage = image->getOpenCLImage();
     view.rowBytes = image->getRowBytes();
     view.bounds = {bounds.x1, bounds.y1, bounds.x2, bounds.y2};
     view.originX = bounds.x1;
@@ -1720,6 +1725,7 @@ LensDiffBackendType backendFromChoice(int index) {
         case 1: return LensDiffBackendType::CpuReference;
         case 2: return LensDiffBackendType::Cuda;
         case 3: return LensDiffBackendType::Metal;
+        case 4: return LensDiffBackendType::OpenCL;
         default: return LensDiffBackendType::Auto;
     }
 }
@@ -1737,6 +1743,11 @@ LensDiffBackendType resolveRenderBackend(const OFX::RenderArguments& args, int b
 #ifdef __APPLE__
     if (args.isEnabledMetalRender && args.pMetalCmdQ != nullptr) {
         return LensDiffBackendType::Metal;
+    }
+#endif
+#if defined(LENSDIFF_HAS_OPENCL)
+    if (kOpenCLRenderImplemented && args.isEnabledOpenCLRender && args.pOpenCLCmdQ != nullptr) {
+        return LensDiffBackendType::OpenCL;
     }
 #endif
     return LensDiffBackendType::CpuReference;
@@ -1909,6 +1920,7 @@ const char* backendName(LensDiffBackendType backend) {
         case LensDiffBackendType::CpuReference: return "CPU";
         case LensDiffBackendType::Cuda: return "CUDA";
         case LensDiffBackendType::Metal: return "Metal";
+        case LensDiffBackendType::OpenCL: return "OpenCL";
         case LensDiffBackendType::Auto:
         default: return "Auto";
     }
@@ -3801,8 +3813,10 @@ void LensDiffEffect::render(const OFX::RenderArguments& args) {
     request.dst = makeImageView(dst.get());
     request.hostEnabledCudaRender = args.isEnabledCudaRender;
     request.hostEnabledMetalRender = args.isEnabledMetalRender;
+    request.hostEnabledOpenCLRender = args.isEnabledOpenCLRender;
     request.cudaStream = args.pCudaStream;
     request.metalCommandQueue = args.pMetalCmdQ;
+    request.openCLCommandQueue = args.pOpenCLCmdQ;
 
     request.frameShortSidePx = lensdiffShortSidePx(dstClip_->getRegionOfDefinition(args.time), args.renderScale);
     const LensDiffParams params = resolveParams(args.time, request.frameShortSidePx);
@@ -3820,7 +3834,8 @@ void LensDiffEffect::render(const OFX::RenderArguments& args) {
     const bool cpuOnlyPhaseSuite = lensdiffNeedsCpuOnlyPhaseSuite(params);
     std::lock_guard<std::mutex> lock(cacheMutex_);
     const bool cpuFallbackAllowed =
-        cpuOnlyPhaseSuite || (!request.hostEnabledCudaRender && !request.hostEnabledMetalRender);
+        cpuOnlyPhaseSuite ||
+        (!request.hostEnabledCudaRender && !request.hostEnabledMetalRender && !request.hostEnabledOpenCLRender);
     if (cpuOnlyPhaseSuite && request.requestedBackend != LensDiffBackendType::CpuReference && cpuFallbackAllowed) {
         attemptedBackend = request.requestedBackend;
         request.requestedBackend = LensDiffBackendType::CpuReference;
@@ -3869,6 +3884,26 @@ void LensDiffEffect::render(const OFX::RenderArguments& args) {
         }
         if (rendered) {
             executedBackend = LensDiffBackendType::Metal;
+        }
+    }
+#endif
+#if defined(LENSDIFF_HAS_OPENCL)
+    if (!rendered && request.requestedBackend == LensDiffBackendType::OpenCL) {
+        request.selectedBackend = LensDiffBackendType::OpenCL;
+        if (logEnabled) {
+            LogLensDiffDiagnosticEvent("host-opencl-call-enter", "about-to-call RunLensDiffOpenCL");
+        }
+        rendered = RunLensDiffOpenCL(request, params, cache_, &error);
+        if (logEnabled) {
+            std::ostringstream oclReturnNote;
+            oclReturnNote << "rendered=" << (rendered ? "true" : "false");
+            if (!error.empty()) {
+                oclReturnNote << " error=" << error;
+            }
+            LogLensDiffDiagnosticEvent("host-opencl-call-return", oclReturnNote.str());
+        }
+        if (rendered) {
+            executedBackend = LensDiffBackendType::OpenCL;
         }
     }
 #endif
@@ -3943,6 +3978,12 @@ public:
 #endif
 #ifdef __APPLE__
         desc.setSupportsMetalRender(true);
+#endif
+#if defined(LENSDIFF_HAS_OPENCL)
+        if (kOpenCLRenderImplemented) {
+            desc.setSupportsOpenCLBuffersRender(true);
+            desc.setSupportsOpenCLImagesRender(true);
+        }
 #endif
     }
 
@@ -4360,6 +4401,7 @@ public:
         backendPreference->appendOption("CPU");
         backendPreference->appendOption("CUDA");
         backendPreference->appendOption("Metal");
+        backendPreference->appendOption("OpenCL");
         backendPreference->setDefault(lensdiffDefaultValues.backendPreference);
         backendPreference->setParent(*composite);
         backendPreference->setIsSecret(true);

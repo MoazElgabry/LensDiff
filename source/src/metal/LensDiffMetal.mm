@@ -51,6 +51,28 @@ std::uint64_t hashKernelValues(const LensDiffKernel& kernel) {
     return hash;
 }
 
+struct PersistentMetalKernelSpectrum {
+    id<MTLBuffer> spectrum = nil;
+    std::size_t bytes = 0;
+};
+
+std::mutex gPersistentMetalKernelSpectrumMutex;
+std::unordered_map<std::string, std::shared_ptr<PersistentMetalKernelSpectrum>> gPersistentMetalKernelSpectra;
+std::size_t gPersistentMetalKernelSpectrumBytes = 0;
+constexpr std::size_t kPersistentMetalKernelSpectrumBudgetBytes = 4ull * 1024ull * 1024ull * 1024ull;
+
+std::string metalKernelSpectrumCacheKey(const LensDiffKernel& kernel, int paddedSize) {
+    return std::to_string(paddedSize) + ":" + std::to_string(kernel.size) + ":" +
+           std::to_string(hashKernelValues(kernel));
+}
+
+std::string persistentMetalKernelSpectrumCacheKey(id<MTLDevice> device,
+                                                  const LensDiffKernel& kernel,
+                                                  int paddedSize) {
+    return std::to_string(reinterpret_cast<std::uintptr_t>(device)) + ":" +
+           metalKernelSpectrumCacheKey(kernel, paddedSize);
+}
+
 template <typename T>
 T clampValue(T value, T lo, T hi) {
     return std::max(lo, std::min(value, hi));
@@ -4411,8 +4433,18 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
                       << ",working=" << width << "x" << height;
         LogLensDiffDiagnosticEvent("metal-render-mode-preflight", preflightNote.str());
     }
-    if (!timeCall(timing.psfBankMs, [&] { return ensurePsfBankMetal(params, cache, device, queue, pipelines, error); })) {
-        return false;
+    const bool selectionDebug = params.debugView == LensDiffDebugView::Selection;
+    const bool staticDebug = params.debugView == LensDiffDebugView::Pupil ||
+                             params.debugView == LensDiffDebugView::Psf ||
+                             params.debugView == LensDiffDebugView::Otf ||
+                             params.debugView == LensDiffDebugView::Phase ||
+                             params.debugView == LensDiffDebugView::PhaseEdge ||
+                             params.debugView == LensDiffDebugView::FieldPsf ||
+                             params.debugView == LensDiffDebugView::ChromaticSplit;
+    if (!selectionDebug) {
+        if (!timeCall(timing.psfBankMs, [&] { return ensurePsfBankMetal(params, cache, device, queue, pipelines, error); })) {
+            return false;
+        }
     }
     {
         const std::string modeNote =
@@ -4543,13 +4575,6 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
         return paramsBuffer != nil &&
                encode2dDispatch(encoder, pipelines->resampleGray, @[srcImage, dstImage, paramsBuffer], dstWidth, dstHeight);
     };
-    const bool staticDebug = params.debugView == LensDiffDebugView::Pupil ||
-                             params.debugView == LensDiffDebugView::Psf ||
-                             params.debugView == LensDiffDebugView::Otf ||
-                             params.debugView == LensDiffDebugView::Phase ||
-                             params.debugView == LensDiffDebugView::PhaseEdge ||
-                             params.debugView == LensDiffDebugView::FieldPsf ||
-                             params.debugView == LensDiffDebugView::ChromaticSplit;
     if (staticDebug) {
         const std::vector<float> debugRgba = buildStaticDebugRgba(params, cache, nativeWidth, nativeHeight);
         id<MTLBuffer> debugBuffer = makeSharedBufferWithBytes(device, debugRgba.data(), nativeRgbaBytes, error);
@@ -4626,6 +4651,62 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
             return false;
         }
     }
+    if (selectionDebug) {
+        const LensDiffImageRect outputRect = intersectRect(request.renderWindow, request.dst.bounds);
+        if (outputRect.width() <= 0 || outputRect.height() <= 0) {
+            renderSucceeded = true;
+            LogLensDiffDiagnosticEvent("metal-output-empty", "selection-renderWindow-outside-dst");
+            return true;
+        }
+        const OutputParamsGpu outParams {
+            nativeWidth, nativeHeight, request.src.bounds.x1, request.src.bounds.y1,
+            request.dst.bounds.x1, request.dst.bounds.y1,
+            request.dst.bounds.x2, request.dst.bounds.y2,
+            outputRect.x1, outputRect.y1,
+            outputRect.x2, outputRect.y2,
+            rowFloats(request.dst), 0, 0, 0};
+        id<MTLBuffer> outParamsBuffer = makeParamBuffer(device, outParams, error);
+        if (outParamsBuffer == nil) {
+            return false;
+        }
+        bool outputOk = false;
+        const auto outputStart = std::chrono::steady_clock::now();
+        if (!resolutionAwareActive) {
+            outputOk = encode2d(pipelines->packGray,
+                                @[mask, dstBuffer, outParamsBuffer],
+                                outputRect.width(),
+                                outputRect.height());
+        } else {
+            id<MTLBuffer> nativeMask = makeNativeScalarBuffer();
+            if (nativeMask == nil) {
+                return false;
+            }
+            id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+            ++renderCounters.commandBufferCount;
+            id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+            const bool ok = encodeResampleGrayDispatch(encoder, mask, nativeMask, width, height, nativeWidth, nativeHeight) &&
+                            encode2dDispatch(encoder,
+                                             pipelines->packGray,
+                                             @[nativeMask, dstBuffer, outParamsBuffer],
+                                             outputRect.width(),
+                                             outputRect.height());
+            [encoder endEncoding];
+            outputOk = ok && commitAndWaitCounted(&renderCounters, commandBuffer, error);
+        }
+        timing.compositeOutputMs += std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                                        std::chrono::steady_clock::now() - outputStart)
+                                        .count();
+        timing.commandBufferCount = renderCounters.commandBufferCount;
+        timing.waitCount = renderCounters.waitCount;
+        timing.waitMs = renderCounters.waitMs;
+        renderSucceeded = outputOk;
+        if (outputOk) {
+            LogLensDiffDiagnosticEvent("metal-selection-output-ready");
+        }
+        logTimingBreakdown();
+        renderScopeResult = outputOk;
+        return outputOk;
+    }
     const float redistributionScale = 1.0f - static_cast<float>(clampValue(params.corePreserve, 0.0, 1.0));
     const float protectedCoreFraction = std::max(
         kMinimumSelectedCoreFloor,
@@ -4639,7 +4720,7 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
         id<MTLBuffer> stack = nil;
     };
 
-    std::unordered_map<std::string, id<MTLBuffer>> kernelSpectrumCache;
+    std::unordered_map<std::string, std::shared_ptr<PersistentMetalKernelSpectrum>> kernelSpectrumCache;
     std::unordered_map<std::string, id<MTLBuffer>> rgbSourceSpectrumCache;
     std::unordered_map<std::string, id<MTLBuffer>> scalarSourceSpectrumCache;
 
@@ -4649,19 +4730,28 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
     auto sourceSpectrumCacheKey = [&](id<MTLBuffer> source, int paddedSize) {
         return std::to_string(reinterpret_cast<std::uintptr_t>(source)) + ":" + std::to_string(paddedSize);
     };
-    auto kernelSpectrumCacheKey = [&](const LensDiffKernel& kernel, int paddedSize) {
-        return std::to_string(paddedSize) + ":" + std::to_string(kernel.size) + ":" + std::to_string(hashKernelValues(kernel));
-    };
     auto getKernelSpectrum = [&](const LensDiffKernel& kernel, int paddedSize, id<MTLBuffer>* outSpectrum) -> bool {
         if (outSpectrum == nullptr) {
             return false;
         }
-        const std::string key = kernelSpectrumCacheKey(kernel, paddedSize);
+        const std::string key = metalKernelSpectrumCacheKey(kernel, paddedSize);
         auto it = kernelSpectrumCache.find(key);
-        if (it != kernelSpectrumCache.end()) {
+        if (it != kernelSpectrumCache.end() && it->second && it->second->spectrum != nil) {
             ++timing.kernelCacheHits;
-            *outSpectrum = it->second;
+            *outSpectrum = it->second->spectrum;
             return true;
+        }
+        const std::string persistentKey = persistentMetalKernelSpectrumCacheKey(device, kernel, paddedSize);
+        {
+            std::lock_guard<std::mutex> lock(gPersistentMetalKernelSpectrumMutex);
+            auto persistent = gPersistentMetalKernelSpectra.find(persistentKey);
+            if (persistent != gPersistentMetalKernelSpectra.end() &&
+                persistent->second && persistent->second->spectrum != nil) {
+                ++timing.kernelCacheHits;
+                kernelSpectrumCache.emplace(key, persistent->second);
+                *outSpectrum = persistent->second->spectrum;
+                return true;
+            }
         }
         id<MTLBuffer> spectrum = nil;
         ++timing.kernelCacheMisses;
@@ -4670,8 +4760,22 @@ bool RunLensDiffMetal(const LensDiffRenderRequest& request,
             })) {
             return false;
         }
-        kernelSpectrumCache.emplace(key, spectrum);
-        *outSpectrum = spectrum;
+        auto entry = std::make_shared<PersistentMetalKernelSpectrum>();
+        entry->spectrum = spectrum;
+        entry->bytes = static_cast<std::size_t>(paddedSize) * static_cast<std::size_t>(paddedSize) * sizeof(float) * 2U;
+        {
+            std::lock_guard<std::mutex> lock(gPersistentMetalKernelSpectrumMutex);
+            auto existing = gPersistentMetalKernelSpectra.find(persistentKey);
+            if (existing != gPersistentMetalKernelSpectra.end() &&
+                existing->second && existing->second->spectrum != nil) {
+                entry = existing->second;
+            } else if (gPersistentMetalKernelSpectrumBytes + entry->bytes <= kPersistentMetalKernelSpectrumBudgetBytes) {
+                gPersistentMetalKernelSpectrumBytes += entry->bytes;
+                gPersistentMetalKernelSpectra.emplace(persistentKey, entry);
+            }
+        }
+        kernelSpectrumCache.emplace(key, entry);
+        *outSpectrum = entry->spectrum;
         return true;
     };
     auto buildRgbSourceSpectra = [&](id<MTLBuffer> source,

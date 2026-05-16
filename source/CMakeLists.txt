@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(LensDiff VERSION 0.2.14 LANGUAGES CXX)
+project(LensDiff VERSION 0.2.15 LANGUAGES CXX)
 
 set(PLUGIN_BASENAME "LensDiff")
-set(CUBE_DISPLAY_VERSION "0.2.14")
+set(CUBE_DISPLAY_VERSION "0.2.15")
 set(PLUGIN_IDENTIFIER "com.moazelgabry.LensDiff")
 set(LOCAL_OFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk")
 set(GENERATED_ASSET_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -62,7 +62,13 @@ if(WIN32 AND NOT DEFINED CUDAToolkit_ROOT)
   endforeach()
 endif()
 
+find_package(OpenCL QUIET)
 find_package(CUDAToolkit QUIET)
+
+set(LENSDIFF_HAS_OPENCL OFF)
+if(OpenCL_FOUND)
+  set(LENSDIFF_HAS_OPENCL ON)
+endif()
 
 set(LENSDIFF_HAS_CUDA OFF)
 if(CUDAToolkit_FOUND AND NOT APPLE)
@@ -113,6 +119,8 @@ add_library(${PLUGIN_BASENAME} SHARED
   ${COMMON_COLOR_DIR}/ColorManagement.cpp
   $<$<BOOL:${LENSDIFF_HAS_CUDA}>:src/cuda/LensDiffCuda.cu>
   $<$<BOOL:${LENSDIFF_HAS_CUDA}>:src/cuda/LensDiffCudaVkFFT.cu>
+  $<$<BOOL:${LENSDIFF_HAS_OPENCL}>:src/opencl/LensDiffOpenCL.cpp>
+  $<$<BOOL:${LENSDIFF_HAS_OPENCL}>:src/opencl/LensDiffOpenCLVkFFT.cpp>
   $<$<PLATFORM_ID:Darwin>:src/core/LensDiffFileDialog.mm>
   $<$<PLATFORM_ID:Darwin>:src/metal/LensDiffMetal.mm>
   $<$<PLATFORM_ID:Darwin>:src/metal/LensDiffMetalVkFFT.mm>
@@ -160,6 +168,20 @@ if(LENSDIFF_HAS_CUDA)
     $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=68>
     $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=177>
     $<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=550>)
+endif()
+
+if(LENSDIFF_HAS_OPENCL)
+  target_compile_definitions(${PLUGIN_BASENAME} PRIVATE
+    LENSDIFF_HAS_OPENCL
+    CL_TARGET_OPENCL_VERSION=120)
+  target_include_directories(${PLUGIN_BASENAME} SYSTEM PRIVATE
+    ${OpenCL_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/VkFFT/vkFFT)
+  target_link_libraries(${PLUGIN_BASENAME} PRIVATE ${OpenCL_LIBRARIES})
+  set_source_files_properties(
+    src/opencl/LensDiffOpenCLVkFFT.cpp
+    PROPERTIES
+      COMPILE_DEFINITIONS "VKFFT_BACKEND=3")
 endif()
 
 if(MSVC)
